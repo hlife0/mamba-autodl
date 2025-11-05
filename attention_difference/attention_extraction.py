@@ -10,6 +10,119 @@ from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
 
+def extract_abc_all_layers(model, tokenizer, prompt, device="cuda:0"):
+    """
+    Extract ABC matrices and compute alpha/beta for all layers in one forward pass.
+    Memory efficient: processes each layer's results immediately and moves to CPU.
+    
+    Returns:
+        dict with 'alpha' [num_layers, seqlen, seqlen, d_inner]
+        and 'beta' [num_layers, seqlen, seqlen, d_inner, d_state]
+    """
+    tokens = tokenizer(prompt, return_tensors="pt")
+    input_ids = tokens['input_ids'].to(device)
+    
+    num_layers = len(model.backbone.layers)
+    all_extracted = [{}] * num_layers
+    
+    # Register hooks for all layers
+    def make_extract_hook(layer_idx):
+        def extract_hook(module, input, output):
+            hidden_states = input[0]
+            batch, seqlen, dim = hidden_states.shape
+            
+            xz = rearrange(
+                module.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+                "d (b l) -> b d l",
+                l=seqlen,
+            )
+            if module.in_proj.bias is not None:
+                xz = xz + rearrange(module.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+            
+            x, z = xz.chunk(2, dim=1)
+            
+            if module.activation in ["silu", "swish"]:
+                x = F.silu(module.conv1d(x)[..., :seqlen])
+            
+            x_dbl = module.x_proj(rearrange(x, "b d l -> (b l) d"))
+            dt, B, C = torch.split(x_dbl, [module.dt_rank, module.d_state, module.d_state], dim=-1)
+            
+            dt = module.dt_proj.weight @ dt.t()
+            dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+            
+            if module.dt_proj.bias is not None:
+                dt = dt + module.dt_proj.bias.float().view(1, -1, 1)
+            dt = F.softplus(dt)
+            
+            B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+            C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+            
+            A = -torch.exp(module.A_log.float())
+            
+            A_expanded = A[None, :, None, :]
+            dt_expanded = dt[:, :, :, None]
+            
+            discrete_A = torch.exp(A_expanded * dt_expanded)
+            discrete_B = dt_expanded * B[:, None, :, :].transpose(2, 3)
+            
+            all_extracted[layer_idx] = {
+                'discrete_A': discrete_A,
+                'discrete_B': discrete_B,
+                'C': C
+            }
+        return extract_hook
+    
+    # Register all hooks
+    handles = []
+    for layer_idx in range(num_layers):
+        target_layer = model.backbone.layers[layer_idx].mixer
+        handle = target_layer.register_forward_hook(make_extract_hook(layer_idx))
+        handles.append(handle)
+    
+    # Single forward pass
+    with torch.no_grad():
+        _ = model(input_ids)
+    
+    # Remove all hooks
+    for handle in handles:
+        handle.remove()
+    
+    # Compute alpha and beta for each layer, move to CPU immediately
+    alphas = []
+    betas = []
+    
+    for layer_idx in range(num_layers):
+        extracted = all_extracted[layer_idx]
+        
+        alpha = calculate_alpha_all_channels(
+            extracted['discrete_A'],
+            extracted['discrete_B'],
+            extracted['C']
+        )
+        beta = calculate_beta_all_channels(
+            extracted['discrete_A'],
+            extracted['C']
+        )
+        
+        alphas.append(alpha.cpu())
+        betas.append(beta.cpu())
+        
+        # Clear this layer's data
+        del extracted
+        torch.cuda.empty_cache()
+    
+    # Stack on CPU
+    alpha_stacked = torch.stack(alphas, dim=0)
+    beta_stacked = torch.stack(betas, dim=0)
+    
+    del alphas, betas
+    
+    return {
+        'alpha': alpha_stacked,
+        'beta': beta_stacked
+    }
+
+
 def extract_abc(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
     """
     Extract discrete A, B, C matrices from a Mamba layer.
@@ -278,14 +391,14 @@ if __name__ == "__main__":
         t_slow = time.time() - t0
         
         # Fast version
-        print(f"\n[2] Running fast version (single channel)...")
+        print(f"\n[2] Running fast version (all channels, extract one)...")
         t0 = time.time()
-        alpha_fast = calculate_alpha_single_channel(
+        alpha_all = calculate_alpha_all_channels(
             result['discrete_A'], 
             result['discrete_B'], 
-            result['C'],
-            channel_idx=0
+            result['C']
         )
+        alpha_fast = alpha_all[:, :, 0]
         t_fast = time.time() - t0
         
         # Compare
@@ -319,4 +432,63 @@ if __name__ == "__main__":
             print(f"  Channel 0 matches single-channel result: {(alpha_all_fast[:, :, 0] - alpha_fast).abs().max():.2e}")
         else:
             print(f"\n[4] Skipping all-channels test (seq_len={seq_len}, d_inner={d_inner} too large)")
+    
+    # Test new API: extract_abc_all_layers
+    print("\n" + "="*60)
+    print("Testing extract_abc_all_layers API")
+    print("="*60)
+    
+    import time
+    
+    print("\n[1] Extracting all layers with new API...")
+    t0 = time.time()
+    result_all_layers = extract_abc_all_layers(model, tokenizer, args.prompt, device=device)
+    t_all_layers = time.time() - t0
+    print(f"  Time: {t_all_layers:.4f}s")
+    print(f"  Alpha shape: {list(result_all_layers['alpha'].shape)}")
+    print(f"  Beta shape: {list(result_all_layers['beta'].shape)}")
+    
+    print("\n[2] Extracting layer 0 with original API...")
+    t0 = time.time()
+    result_layer0 = extract_abc(model, tokenizer, args.prompt, layer_idx=0, device=device)
+    alpha_layer0 = calculate_alpha_all_channels(
+        result_layer0['discrete_A'],
+        result_layer0['discrete_B'],
+        result_layer0['C']
+    )
+    beta_layer0 = calculate_beta_all_channels(
+        result_layer0['discrete_A'],
+        result_layer0['C']
+    )
+    t_layer0 = time.time() - t0
+    print(f"  Time: {t_layer0:.4f}s")
+    print(f"  Alpha shape: {list(alpha_layer0.shape)}")
+    print(f"  Beta shape: {list(beta_layer0.shape)}")
+    
+    print("\n[3] Comparing layer 0 results...")
+    alpha_diff = (result_all_layers['alpha'][0].cpu() - alpha_layer0.cpu()).abs()
+    beta_diff = (result_all_layers['beta'][0].cpu() - beta_layer0.cpu()).abs()
+    
+    print(f"  Alpha max diff: {alpha_diff.max():.2e}")
+    print(f"  Alpha mean diff: {alpha_diff.mean():.2e}")
+    print(f"  Beta max diff: {beta_diff.max():.2e}")
+    print(f"  Beta mean diff: {beta_diff.mean():.2e}")
+    
+    if alpha_diff.max() < 1e-4 and beta_diff.max() < 1e-4:
+        print("  ✓ Layer 0 results match!")
+    else:
+        print("  ⚠ Warning: large difference detected")
+    
+    print("\n[4] Verifying all layers have reasonable values...")
+    num_layers = result_all_layers['alpha'].shape[0]
+    print(f"  Number of layers: {num_layers}")
+    
+    for layer_idx in range(min(3, num_layers)):
+        alpha_layer = result_all_layers['alpha'][layer_idx]
+        beta_layer = result_all_layers['beta'][layer_idx]
+        print(f"  Layer {layer_idx}:")
+        print(f"    Alpha range: [{alpha_layer.min():.2e}, {alpha_layer.max():.2e}]")
+        print(f"    Beta range: [{beta_layer.min():.2e}, {beta_layer.max():.2e}]")
+    
+    print("="*60)
 

@@ -18,7 +18,7 @@ from cache_extraction import extract_cache_diff
 
 def build_prompt(question, doc1, doc2):
     fewshot = (
-        "Q: Who is older, Alice or Bob?\n"
+        "Q: Alice is twelve years old. Bob is eleven years old. Who is older, Alice or Bob?\n"
         "A: Alice\n\n"
         "Q: Are cats and dogs both mammals?\n"
         "A: yes\n\n"
