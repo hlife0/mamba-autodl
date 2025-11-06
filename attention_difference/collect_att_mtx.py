@@ -4,13 +4,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import torch
-import gc
 from datetime import datetime
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from dataset.hotpot import HotpotQAIterator
-from attention_extraction import extract_abc_all_layers
+from attention_extraction import (
+    extract_abc, 
+    extract_cummulated_Abar_right, 
+    extract_alpha_last, 
+    extract_beta_last
+)
 
 def build_prompt(question, doc1, doc2):
     fewshot = (
@@ -30,19 +34,19 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
     parser.add_argument('--tokenizer_name', type=str, default='EleutherAI/gpt-neox-20b', help='Tokenizer name')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
-    parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
-    parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples')
-    parser.add_argument('--num_partial_samples', type=int, default=100, help='Number of partial samples')
+    parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')   # GPU 0 only allowed for testing
+    parser.add_argument('--num_samples', type=int, default=2, help='Number of samples') # for testing
+    parser.add_argument('--num_partial_samples', type=int, default=1, help='Number of partial samples') # testing
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--output_dir', type=str, default='./attention_difference/att_mtx', help='Output directory')
-    parser.add_argument('--experiment_name', type=str, default='first_second_att', help='Experiment name')
+    parser.add_argument('--experiment_name', type=str, default='alpha_beta_to_last', help='Experiment name')
     args = parser.parse_args()
     
     device = args.device
     dtype = torch.float16 if 'cuda' in device else torch.float32
     
     print("=" * 70)
-    print("ATTENTION MATRIX COLLECTION")
+    print("ATTENTION TO LAST TOKEN COLLECTION")
     print("=" * 70)
     print(f"Model: {args.model_path}")
     print(f"Device: {device}")
@@ -51,6 +55,10 @@ if __name__ == "__main__":
     print(f"Partial samples: {args.num_partial_samples}")
     print(f"Seed: {args.seed}")
     print(f"Experiment: {args.experiment_name}")
+    print()
+    print("Extraction strategy:")
+    print("  - Alpha: all tokens → last token (full sequence)")
+    print("  - Beta: last 4 tokens of first_half → last token")
     print()
     
     # Load model and tokenizer ONCE
@@ -106,22 +114,64 @@ if __name__ == "__main__":
             full_prompt = first_half + second_half
             
             try:
-                # Extract all layers in one forward pass
-                result = extract_abc_all_layers(model, tokenizer, full_prompt, device=device)
-                alpha_stacked = result['alpha']
-                beta_stacked = result['beta']
+                # Tokenize to get sequence length and first_half token positions
+                tokens = tokenizer(full_prompt, return_tensors="pt")
+                seq_len = tokens['input_ids'].shape[1]
                 
-                # Clear intermediate results
-                del result
-                torch.cuda.empty_cache()
+                # Calculate first_half token count
+                first_half_tokens = tokenizer(first_half, return_tensors="pt")
+                num_first_half_tokens = first_half_tokens['input_ids'].shape[1]
+                
+                # Last 4 tokens in first_half
+                if num_first_half_tokens >= 4:
+                    last_4_tokens_first_half = list(range(num_first_half_tokens - 4, num_first_half_tokens))
+                else:
+                    last_4_tokens_first_half = list(range(num_first_half_tokens))
+                
+                # All tokens (for alpha)
+                all_tokens = list(range(seq_len))
+                
+                # Extract alpha and beta for all 64 layers
+                num_layers = 64
+                alpha_all_layers = []
+                beta_all_layers = []
+                
+                for layer_idx in range(num_layers):
+                    # Extract ABC for this layer
+                    result = extract_abc(model, tokenizer, full_prompt, layer_idx=layer_idx, device=device)
+                    
+                    # Compute cumulated Abar (O(n) complexity)
+                    Abar = extract_cummulated_Abar_right(result['discrete_A'])
+                    
+                    # Extract alpha: all tokens → last token [seqlen, d_inner]
+                    alpha = extract_alpha_last(Abar, result['discrete_B'], result['C'], all_tokens)
+                    alpha_all_layers.append(alpha.cpu())  # Move to CPU immediately
+                    
+                    # Extract beta: last 4 tokens of first_half → last token [4, d_inner, d_state]
+                    beta = extract_beta_last(Abar, result['C'], last_4_tokens_first_half)
+                    beta_all_layers.append(beta.cpu())  # Move to CPU immediately
+                    
+                    # Clear GPU memory for this layer
+                    del result, Abar, alpha, beta
+                    torch.cuda.empty_cache()
+                
+                # Stack all layers
+                alpha_stacked = torch.stack(alpha_all_layers, dim=0)  # [64, seqlen, d_inner]
+                beta_stacked = torch.stack(beta_all_layers, dim=0)    # [64, 4, d_inner, d_state]
+                
+                # Clear intermediate lists
+                del alpha_all_layers, beta_all_layers
                 
                 # Save the attention matrix tensors
                 output_file = os.path.join(output_subdir, f"att_mtx_{count:04d}.pt")
                 torch.save({
-                    'alpha': alpha_stacked,  # [64, seqlen, seqlen, d_inner]
-                    'beta': beta_stacked,    # [64, seqlen, seqlen, d_inner, d_state]
+                    'alpha': alpha_stacked,  # [64, seqlen, d_inner] - all tokens → last token
+                    'beta': beta_stacked,    # [64, 4, d_inner, d_state] - last 4 of first_half → last token
+                    'last_4_tokens_first_half': last_4_tokens_first_half,
                     'len_first_half': len_first_half,
                     'len_second_half': len_second_half,
+                    'num_first_half_tokens': num_first_half_tokens,
+                    'seq_len': seq_len,
                     'id_doc1_question': doc1_id,
                     'id_doc2_question': doc2_id,
                     'question': item.question,
@@ -136,6 +186,8 @@ if __name__ == "__main__":
                 
             except Exception as e:
                 print(f"\nError processing pair ({doc1_id}, {doc2_id}): {e}")
+                import traceback
+                traceback.print_exc()
                 pbar.update(1)
                 continue
     

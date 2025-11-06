@@ -9,131 +9,11 @@ from einops import rearrange
 from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
-
-def extract_abc_all_layers(model, tokenizer, prompt, device="cuda:0"):
-    """
-    Extract ABC matrices and compute alpha/beta for all layers in one forward pass.
-    Memory efficient: processes each layer's results immediately and moves to CPU.
-    
-    Returns:
-        dict with 'alpha' [num_layers, seqlen, seqlen, d_inner]
-        and 'beta' [num_layers, seqlen, seqlen, d_inner, d_state]
-    """
-    tokens = tokenizer(prompt, return_tensors="pt")
-    input_ids = tokens['input_ids'].to(device)
-    
-    num_layers = len(model.backbone.layers)
-    all_extracted = [{}] * num_layers
-    
-    # Register hooks for all layers
-    def make_extract_hook(layer_idx):
-        def extract_hook(module, input, output):
-            hidden_states = input[0]
-            batch, seqlen, dim = hidden_states.shape
-            
-            xz = rearrange(
-                module.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
-                "d (b l) -> b d l",
-                l=seqlen,
-            )
-            if module.in_proj.bias is not None:
-                xz = xz + rearrange(module.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
-            
-            x, z = xz.chunk(2, dim=1)
-            
-            if module.activation in ["silu", "swish"]:
-                x = F.silu(module.conv1d(x)[..., :seqlen])
-            
-            x_dbl = module.x_proj(rearrange(x, "b d l -> (b l) d"))
-            dt, B, C = torch.split(x_dbl, [module.dt_rank, module.d_state, module.d_state], dim=-1)
-            
-            dt = module.dt_proj.weight @ dt.t()
-            dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
-            
-            if module.dt_proj.bias is not None:
-                dt = dt + module.dt_proj.bias.float().view(1, -1, 1)
-            dt = F.softplus(dt)
-            
-            B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            
-            A = -torch.exp(module.A_log.float())
-            
-            A_expanded = A[None, :, None, :]
-            dt_expanded = dt[:, :, :, None]
-            
-            discrete_A = torch.exp(A_expanded * dt_expanded)
-            discrete_B = dt_expanded * B[:, None, :, :].transpose(2, 3)
-            
-            all_extracted[layer_idx] = {
-                'discrete_A': discrete_A,
-                'discrete_B': discrete_B,
-                'C': C
-            }
-        return extract_hook
-    
-    # Register all hooks
-    handles = []
-    for layer_idx in range(num_layers):
-        target_layer = model.backbone.layers[layer_idx].mixer
-        handle = target_layer.register_forward_hook(make_extract_hook(layer_idx))
-        handles.append(handle)
-    
-    # Single forward pass
-    with torch.no_grad():
-        _ = model(input_ids)
-    
-    # Remove all hooks
-    for handle in handles:
-        handle.remove()
-    
-    # Compute alpha and beta for each layer, move to CPU immediately
-    alphas = []
-    betas = []
-    
-    for layer_idx in range(num_layers):
-        extracted = all_extracted[layer_idx]
-        
-        alpha = calculate_alpha_all_channels(
-            extracted['discrete_A'],
-            extracted['discrete_B'],
-            extracted['C']
-        )
-        beta = calculate_beta_all_channels(
-            extracted['discrete_A'],
-            extracted['C']
-        )
-        
-        alphas.append(alpha.cpu())
-        betas.append(beta.cpu())
-        
-        # Clear this layer's data
-        del extracted
-        torch.cuda.empty_cache()
-    
-    # Stack on CPU
-    alpha_stacked = torch.stack(alphas, dim=0)
-    beta_stacked = torch.stack(betas, dim=0)
-    
-    del alphas, betas
-    
-    return {
-        'alpha': alpha_stacked,
-        'beta': beta_stacked
-    }
-
-
 def extract_abc(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
     """
     Extract discrete A, B, C matrices from a Mamba layer.
     
-    Note on Mamba architecture:
-    - Original B, C: shared across all d_inner channels [batch, d_state, seqlen]
-    - A, dt: channel-specific [d_inner, ...] 
-    - discrete_A = exp(A * dt): channel-specific due to channel-specific A and dt
-    - discrete_B = dt * B: channel-specific due to channel-specific dt (despite shared B)
-    
-    Returns: dict with keys [ssm_input, ssm_output, discrete_A, discrete_B, C, dt, A_continuous, D]
+    Returns: dict with keys [discrete_A, discrete_B, C]
     """
     tokens = tokenizer(prompt, return_tensors="pt")
     input_ids = tokens['input_ids'].to(device)
@@ -144,6 +24,7 @@ def extract_abc(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
         hidden_states = input[0]
         batch, seqlen, dim = hidden_states.shape
         
+        # Get x projection
         xz = rearrange(
             module.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
             "d (b l) -> b d l",
@@ -157,12 +38,12 @@ def extract_abc(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
         if module.activation in ["silu", "swish"]:
             x = F.silu(module.conv1d(x)[..., :seqlen])
         
+        # Get dt, B, C
         x_dbl = module.x_proj(rearrange(x, "b d l -> (b l) d"))
         dt, B, C = torch.split(x_dbl, [module.dt_rank, module.d_state, module.d_state], dim=-1)
         
         dt = module.dt_proj.weight @ dt.t()
         dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
-        
         if module.dt_proj.bias is not None:
             dt = dt + module.dt_proj.bias.float().view(1, -1, 1)
         dt = F.softplus(dt)
@@ -170,41 +51,20 @@ def extract_abc(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         
+        # Compute discrete A and B
         A = -torch.exp(module.A_log.float())
-        
         A_expanded = A[None, :, None, :]
         dt_expanded = dt[:, :, :, None]
         
         discrete_A = torch.exp(A_expanded * dt_expanded)
         discrete_B = dt_expanded * B[:, None, :, :].transpose(2, 3)
         
-        # Pre-convert to target dtype to avoid repeated conversions
-        discrete_A_conv = discrete_A.to(x.dtype)
-        discrete_B_conv = discrete_B.to(x.dtype)
-        C_conv = C.to(x.dtype)
-        
-        ssm_state = torch.zeros(
-            (batch, module.d_inner, module.d_state),
-            device=hidden_states.device, 
-            dtype=x.dtype
-        )
-        
-        # Preallocate output tensor instead of list append
-        scan_output = torch.zeros((batch, module.d_inner, seqlen), device=x.device, dtype=x.dtype)
-        
-        for t in range(seqlen):
-            ssm_state = discrete_A_conv[:, :, t, :] * ssm_state + \
-                       discrete_B_conv[:, :, t, :] * x[:, :, t, None]
-            scan_output[:, :, t] = torch.einsum('bdn,bn->bd', ssm_state, C_conv[:, :, t])
-        
-        extracted['ssm_input'] = x
-        extracted['ssm_output'] = scan_output
         extracted['discrete_A'] = discrete_A
         extracted['discrete_B'] = discrete_B
         extracted['C'] = C
-        extracted['dt'] = dt
-        extracted['A_continuous'] = A
-        extracted['D'] = module.D
+        
+        # Clean up
+        del xz, x, z, x_dbl, dt, B, A, A_expanded, dt_expanded
     
     target_layer = model.backbone.layers[layer_idx].mixer
     hook_handle = target_layer.register_forward_hook(extract_hook)
@@ -215,6 +75,118 @@ def extract_abc(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
     hook_handle.remove()
     
     return extracted
+
+def extract_cummulated_Abar_right(discrete_A):
+    """
+    Perform the function A => A.scanRight(_ elem-wise product _)
+    
+    Computes: Abar[b, ch, i, s] = ∏_{j=i+1}^{seqlen-1} A[b, ch, j, s]
+    
+    This is the cumulative product from position i+1 to the last position (seqlen-1).
+    Used to compute attention scores from each token to the LAST token:
+      - Abar * C[last_token] → beta (state propagation weights)
+      - beta * B[token] → alpha (final attention score)
+    
+    Args:
+        discrete_A: [batch, d_inner, seqlen, d_state]
+    
+    Returns:
+        Abar: [batch, d_inner, seqlen, d_state]
+              Abar[i] = A[i+1] * A[i+2] * ... * A[seqlen-1]
+              Abar[seqlen-1] = 1 (no tokens after)
+    """
+    # Use log-space to avoid numerical issues
+    log_A = torch.log(discrete_A + 1e-10)
+    
+    # Cumulative sum from right (reverse cumsum)
+    # Step 1: flip along seqlen dimension
+    log_A_flipped = torch.flip(log_A, dims=[2])
+    
+    # Step 2: cumsum (now accumulating from what was the right)
+    log_cumsum_flipped = torch.cumsum(log_A_flipped, dim=2)
+    
+    # Step 3: flip back
+    log_cumsum = torch.flip(log_cumsum_flipped, dims=[2])
+    
+    # Now log_cumsum[i] = sum(log_A[i:]) = log(∏_{j=i}^{seqlen-1} A[j])
+    # We want log(∏_{j=i+1}^{seqlen-1} A[j]) = log_cumsum[i] - log_A[i]
+    log_Abar = log_cumsum - log_A
+    
+    # Convert back from log-space
+    Abar = torch.exp(log_Abar)
+    
+    # Clean up
+    del log_A, log_A_flipped, log_cumsum_flipped, log_cumsum, log_Abar
+    return Abar
+
+def extract_beta_last(cumulated_Abar, C, tokens):
+    """
+    Extract beta (state propagation weights) from specified tokens to the LAST token.
+    
+    Formula: beta[j, ch, s] = Abar[ch, j, s] * C[s, last]
+    
+    This represents how state dimension s at token j propagates to the output at the last token,
+    for each channel ch.
+    
+    Args:
+        cumulated_Abar: [batch, d_inner, seqlen, d_state] - from extract_cummulated_Abar_right
+        C: [batch, d_state, seqlen] - C matrix
+        tokens: List[int] - token positions to extract beta for
+    
+    Returns:
+        beta: [len(tokens), d_inner, d_state]
+              beta[i, ch, s] = state propagation weight from tokens[i] to last token
+    """
+    batch, d_inner, seqlen, d_state = cumulated_Abar.shape
+    last_idx = seqlen - 1
+    
+    # Get C for the last token: [d_state]
+    C_last = C[0, :, last_idx].float()  # [d_state]
+    
+    # Get Abar for specified tokens: [len(tokens), d_inner, d_state]
+    Abar_selected = cumulated_Abar[0, :, tokens, :].float()  # [d_inner, len(tokens), d_state]
+    Abar_selected = Abar_selected.permute(1, 0, 2)  # [len(tokens), d_inner, d_state]
+    
+    # Compute beta: element-wise multiply with C_last
+    # beta[i, ch, s] = Abar[ch, tokens[i], s] * C[s, last]
+    beta = Abar_selected * C_last[None, None, :]  # [len(tokens), d_inner, d_state]
+    
+    return beta
+
+def extract_alpha_last(cumulated_Abar, discrete_B, C, tokens):
+    """
+    Extract alpha (attention scores) from specified tokens to the LAST token.
+    
+    Formula: alpha[j, ch] = sum_s (Abar[ch, j, s] * B[ch, j, s] * C[s, last])
+    
+    This represents the attention weight from token j to the last token, for each channel ch.
+    
+    Args:
+        cumulated_Abar: [batch, d_inner, seqlen, d_state] - from extract_cummulated_Abar_right
+        discrete_B: [batch, d_inner, seqlen, d_state] - discrete B matrix
+        C: [batch, d_state, seqlen] - C matrix
+        tokens: List[int] - token positions to extract alpha for
+    
+    Returns:
+        alpha: [len(tokens), d_inner]
+               alpha[i, ch] = attention score from tokens[i] to last token
+    """
+    batch, d_inner, seqlen, d_state = cumulated_Abar.shape
+    last_idx = seqlen - 1
+    
+    # Get C for the last token: [d_state]
+    C_last = C[0, :, last_idx].float()  # [d_state]
+    
+    # Get Abar and B for specified tokens
+    Abar_selected = cumulated_Abar[0, :, tokens, :].float()  # [d_inner, len(tokens), d_state]
+    B_selected = discrete_B[0, :, tokens, :].float()  # [d_inner, len(tokens), d_state]
+    
+    # Compute alpha: einsum over state dimension
+    # alpha[i, ch] = sum_s (Abar[ch, i, s] * B[ch, i, s] * C[s])
+    alpha = torch.einsum('cjs,cjs,s->jc', Abar_selected, B_selected, C_last)  # [len(tokens), d_inner]
+    
+    return alpha
+
 
 def calculate_alpha_all_channels(discrete_A, discrete_B, C):
     """
@@ -245,11 +217,95 @@ def calculate_alpha_all_channels(discrete_A, discrete_B, C):
     mask = torch.triu(torch.ones(seq_len, seq_len, device=A.device, dtype=torch.bool), diagonal=1)
     A_cumprod[:, mask, :] = 0
     
+    # Release intermediate tensors
+    del log_A, log_A_cumsum, log_A_cumsum_i, log_A_cumsum_j, log_A_cumprod, mask
+    
     B_effective = A_cumprod * B[:, None, :, :]
+    del A_cumprod  # Release after creating B_effective
+    
     alpha_matrix = torch.einsum('si,cijs->ijc', C_mat, B_effective)
+    del B_effective  # Release after einsum
     
     diagonal_alpha = torch.einsum('si,cis->ic', C_mat, B)
     alpha_matrix.diagonal(dim1=0, dim2=1).copy_(diagonal_alpha.T)
+    
+    # Release remaining tensors
+    del A, B, C_mat, diagonal_alpha
+    
+    return alpha_matrix
+
+def calculate_alpha_last_tokens(discrete_A, discrete_B, C, last_tokens):
+    """
+    Calculate alpha attention matrix for ONLY the last N tokens (memory efficient version).
+    
+    This function computes attention only for the last `last_tokens` positions as queries,
+    while keeping all positions as keys. This reduces memory from O(seqlen²) to O(last_tokens × seqlen).
+    
+    α_{i,j,ch} = Σ_s C_{i,s} * (∏_{k=j+1}^{i} A_{k,ch,s}) * discrete_B_{j,ch,s}
+    
+    Args:
+        discrete_A: [batch, d_inner, seqlen, d_state]
+        discrete_B: [batch, d_inner, seqlen, d_state]
+        C: [batch, d_state, seqlen]
+        last_tokens: Number of last tokens to compute attention for (as queries)
+    
+    Returns: 
+        [last_tokens, seqlen, d_inner] where alpha[i,j,ch] represents attention from 
+        query position (seqlen-last_tokens+i) to key position j for channel ch.
+        
+    Example:
+        If seqlen=651 and last_tokens=100:
+        - Output shape: [100, 651, 5120]
+        - Output[0] = attention from position 551 to all positions
+        - Output[99] = attention from position 650 to all positions
+    """
+    A = discrete_A[0].float()
+    B = discrete_B[0].float()
+    C_mat = C[0].float()
+    
+    d_inner, seq_len, d_state = A.shape
+    
+    # Determine query positions (last N tokens)
+    query_len = min(last_tokens, seq_len)
+    query_start = seq_len - query_len
+    
+    log_A = torch.log(A + 1e-10)
+    log_A_cumsum = torch.cumsum(log_A, dim=1)
+    
+    # Only compute for selected query positions
+    log_A_cumsum_i = log_A_cumsum[:, query_start:, None, :]  # [d_inner, query_len, 1, d_state]
+    log_A_cumsum_j = log_A_cumsum[:, None, :, :]              # [d_inner, 1, seq_len, d_state]
+    
+    log_A_cumprod = log_A_cumsum_i - log_A_cumsum_j
+    A_cumprod = torch.exp(log_A_cumprod)  # [d_inner, query_len, seq_len, d_state]
+    
+    # Mask: prevent attending to future tokens
+    mask = torch.zeros(query_len, seq_len, device=A.device, dtype=torch.bool)
+    for i_rel in range(query_len):
+        i_abs = query_start + i_rel
+        mask[i_rel, i_abs+1:] = True
+    A_cumprod[:, mask, :] = 0
+    
+    B_effective = A_cumprod * B[:, None, :, :]  # [d_inner, query_len, seq_len, d_state]
+    
+    # Release large intermediate tensors
+    del log_A, log_A_cumsum, log_A_cumsum_i, log_A_cumsum_j, log_A_cumprod, A_cumprod, mask
+    
+    # Compute alpha for selected query positions
+    C_selected = C_mat[:, query_start:]  # [d_state, query_len]
+    alpha_matrix = torch.einsum('si,cijs->ijc', C_selected, B_effective)  # [query_len, seq_len, d_inner]
+    
+    # Release B_effective after einsum
+    del B_effective, C_selected
+    
+    # Diagonal elements (i == j)
+    for i_rel in range(query_len):
+        i_abs = query_start + i_rel
+        diagonal_alpha = torch.einsum('s,cs->c', C_mat[:, i_abs], B[:, i_abs, :])  # [d_inner]
+        alpha_matrix[i_rel, i_abs, :] = diagonal_alpha
+    
+    # Release remaining large tensors
+    del A, B, C_mat
     
     return alpha_matrix
 
@@ -297,198 +353,126 @@ def calculate_beta_all_channels(discrete_A, C):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="state-spaces/mamba-2.8b")
-    parser.add_argument("--tokenizer_name", type=str, default="EleutherAI/gpt-neox-20b")
-    parser.add_argument("--prompt", type=str, default="Hello world! This is a test.")
-    parser.add_argument("--layer_idx", type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--verify", action="store_true", help="Verify against slow version")
-    args = parser.parse_args()
-    
-    device = args.device if torch.cuda.is_available() else "cpu"
+    # Simple test - no arguments needed
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if "cuda" in device else torch.float32
     
-    print(f"Loading model: {args.model_name}")
-    print(f"Device: {device}\n")
-    
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
-    model = MambaLMHeadModel.from_pretrained(args.model_name, device=device, dtype=dtype)
+    print("Loading model...")
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+    model = MambaLMHeadModel.from_pretrained("state-spaces/mamba-2.8b", device=device, dtype=dtype)
     model.eval()
     
-    print(f"Extracting from layer {args.layer_idx}...\n")
+    # Test with SHORT sequence for verification
+    prompt = "Hello world! This is a test."
     
-    result = extract_abc(
-        model,
-        tokenizer,
-        args.prompt, 
-        layer_idx=args.layer_idx,
-        device=device
-    )
+    print()
     
-    print("Extracted matrices:")
-    for name, tensor in result.items():
-        print(f"  {name:20s}: {list(tensor.shape)}")
-    
-    # Test alpha-beta relationship
-    print("\n" + "="*60)
-    print("Testing Alpha-Beta relationship")
-    print("="*60)
-    
+    result = extract_abc(model, tokenizer, prompt, layer_idx=0, device=device)
     seq_len = result['discrete_A'].shape[2]
-    d_inner = result['discrete_A'].shape[1]
-    d_state = result['discrete_A'].shape[3]
+    print(f"Sequence length: {seq_len} tokens")
+    print(f"Shape of discrete_A: {result['discrete_A'].shape}")
+    print(f"Shape of discrete_B: {result['discrete_B'].shape}")
+    print(f"Shape of C: {result['C'].shape}")
     
-    # Memory estimate: beta is [seq, seq, d_inner, d_state] in float32
-    beta_size_mb = (seq_len * seq_len * d_inner * d_state * 4) / (1024**2)
+    # Test extract_cummulated_Abar_right
+    print("\n" + "="*80)
+    print("Testing extract_cummulated_Abar_right (O(n) method)...")
+    print("="*80)
+    Abar = extract_cummulated_Abar_right(result['discrete_A'])
+    print(f"Abar shape: {list(Abar.shape)}")
     
-    if beta_size_mb < 500:  # Only skip if > 500MB
-        print(f"Computing alpha and beta (estimated memory: {beta_size_mb:.1f}MB)...")
+    # Compute attention to last token using Abar (O(n) complexity!)
+    last_idx = seq_len - 1
+    C_last = result['C'][0, :, last_idx].float()  # [d_state]
+    discrete_B_data = result['discrete_B'][0].float()  # [d_inner, seqlen, d_state]
+    Abar_data = Abar[0].float()  # [d_inner, seqlen, d_state]
+    
+    # alpha[j, ch] = sum_s (Abar[ch, j, s] * B[ch, j, s] * C_last[s])
+    alpha_to_last_fast = torch.einsum('cjs,cjs,s->jc', Abar_data, discrete_B_data, C_last)  # [seqlen, d_inner]
+    print(f"Alpha (all tokens → last token) shape: {list(alpha_to_last_fast.shape)}")
+    
+    # Verify against the trusted method from extract_ABC.py
+    print("\n" + "="*80)
+    print("Verifying against trusted iterative method (extract_ABC.py style)...")
+    print("="*80)
+    
+    A = result['discrete_A'][0].float()  # [d_inner, seqlen, d_state]
+    B = result['discrete_B'][0].float()  # [d_inner, seqlen, d_state]
+    C = result['C'][0].float()  # [d_state, seqlen]
+    d_inner, seq_len_check, d_state = A.shape
+    
+    # Calculate alpha for the LAST token (i = last_idx) using verified method
+    alpha_to_last_verified = torch.zeros(seq_len, d_inner, device=A.device, dtype=A.dtype)
+    
+    for ch in range(d_inner):
+        # For output position i = last_idx
+        i = last_idx
+        A_prod = torch.ones(d_state, device=A.device, dtype=A.dtype)
         
-        alpha = calculate_alpha_all_channels(
-            result['discrete_A'],
-            result['discrete_B'],
-            result['C']
-        )
-        print(f"  Alpha shape: {list(alpha.shape)}")
+        # alpha[i, i] = C[i] · B[ch, i]
+        alpha_ii = torch.dot(C[:, i], B[ch, i, :])
+        alpha_to_last_verified[i, ch] = alpha_ii
         
-        beta = calculate_beta_all_channels(
-            result['discrete_A'],
-            result['C']
-        )
-        print(f"  Beta shape: {list(beta.shape)}")
-        
-        # Reconstruct alpha from beta: α[i,j,ch] = Σ_s β[i,j,ch,s] * B[ch,j,s]
-        discrete_B_data = result['discrete_B'][0].float()  # [d_inner, seqlen, d_state]
-        alpha_reconstructed = torch.einsum('ijcs,cjs->ijc', beta, discrete_B_data)
-        
-        diff = (alpha - alpha_reconstructed).abs()
-        print(f"\nVerification: α = β · discrete_B")
-        print(f"  Max difference: {diff.max():.2e}")
-        print(f"  Mean difference: {diff.mean():.2e}")
-        
-        if diff.max() < 1e-4:
-            print("  ✓ Relationship verified: α_{i,j,ch} = Σ_s β_{i,j,ch,s} * B_{j,ch,s}")
-        else:
-            print(f"  ⚠ Warning: large difference detected")
+        # alpha[i, j] for j < i
+        for j in range(i - 1, -1, -1):
+            # A_prod *= A[ch, j+1]
+            A_prod = A_prod * A[ch, j + 1, :]
+            # alpha[i, j] = C[i] · (A_prod * B[ch, j])
+            B_effective = A_prod * B[ch, j, :]
+            alpha_ij = torch.dot(C[:, i], B_effective)
+            alpha_to_last_verified[j, ch] = alpha_ij
+    
+    print("Verified alpha calculation complete.")
+    
+    # Compare results
+    print("\n" + "="*80)
+    print("Comparison Results:")
+    print("="*80)
+    diff = (alpha_to_last_fast - alpha_to_last_verified).abs()
+    print(f"Max difference: {diff.max():.2e}")
+    print(f"Mean difference: {diff.mean():.2e}")
+    
+    if diff.max() < 1e-4:
+        print("✓ PASS: extract_cummulated_Abar_right matches verified method!")
     else:
-        print(f"Skipping test (estimated memory: {beta_size_mb:.1f}MB > 500MB)")
+        print("✗ FAIL: Results differ significantly!")
     
-    print("="*60)
+    print(f"\nDiagonal element (last token to itself):")
+    print(f"  Fast method: {alpha_to_last_fast[-1, 0]:.6f}")
+    print(f"  Verified:    {alpha_to_last_verified[-1, 0]:.6f}")
     
-    if args.verify:
-        print("\n" + "="*60)
-        print("Verification: comparing fast vs slow implementation")
-        print("="*60)
-        
-        from attention_difference.extract_ABC import calculate_alpha_for_one_channel_verified
-        import time
-        
-        # Slow version
-        print("\n[1] Running slow version (single channel)...")
-        t0 = time.time()
-        alpha_slow = calculate_alpha_for_one_channel_verified(result, channel_idx=0)
-        t_slow = time.time() - t0
-        
-        # Fast version
-        print(f"\n[2] Running fast version (all channels, extract one)...")
-        t0 = time.time()
-        alpha_all = calculate_alpha_all_channels(
-            result['discrete_A'], 
-            result['discrete_B'], 
-            result['C']
-        )
-        alpha_fast = alpha_all[:, :, 0]
-        t_fast = time.time() - t0
-        
-        # Compare
-        diff = (alpha_slow - alpha_fast).abs()
-        print(f"\n[3] Comparison:")
-        print(f"  Max difference: {diff.max():.2e}")
-        print(f"  Mean difference: {diff.mean():.2e}")
-        print(f"  Time (slow): {t_slow:.4f}s")
-        print(f"  Time (fast): {t_fast:.4f}s")
-        print(f"  Speedup: {t_slow/t_fast:.2f}x")
-        
-        if diff.max() < 1e-4:
-            print("  ✓ Results match!")
-        else:
-            print(f"  ⚠ Warning: large difference detected")
-        
-        # Test all channels (if sequence is short enough)
-        seq_len = result['discrete_A'].shape[2]
-        d_inner = result['discrete_A'].shape[1]
-        if seq_len < 50 and d_inner < 1000:
-            print(f"\n[4] Testing all channels ({d_inner} channels)...")
-            t0 = time.time()
-            alpha_all_fast = calculate_alpha_all_channels(
-                result['discrete_A'], 
-                result['discrete_B'], 
-                result['C']
-            )
-            t_all = time.time() - t0
-            print(f"  Alpha matrix shape: {list(alpha_all_fast.shape)}")
-            print(f"  Time: {t_all:.4f}s")
-            print(f"  Channel 0 matches single-channel result: {(alpha_all_fast[:, :, 0] - alpha_fast).abs().max():.2e}")
-        else:
-            print(f"\n[4] Skipping all-channels test (seq_len={seq_len}, d_inner={d_inner} too large)")
+    # Test extract_alpha_last and extract_beta_last
+    print("\n" + "="*80)
+    print("Testing extract_alpha_last and extract_beta_last...")
+    print("="*80)
     
-    # Test new API: extract_abc_all_layers
-    print("\n" + "="*60)
-    print("Testing extract_abc_all_layers API")
-    print("="*60)
+    # Select some tokens to extract (e.g., first, middle, last)
+    test_tokens = [0, seq_len // 2, seq_len - 1]
+    print(f"Extracting attention for tokens: {test_tokens}")
     
-    import time
+    # Extract alpha and beta for selected tokens
+    alpha_selected = extract_alpha_last(Abar, result['discrete_B'], result['C'], test_tokens)
+    beta_selected = extract_beta_last(Abar, result['C'], test_tokens)
     
-    print("\n[1] Extracting all layers with new API...")
-    t0 = time.time()
-    result_all_layers = extract_abc_all_layers(model, tokenizer, args.prompt, device=device)
-    t_all_layers = time.time() - t0
-    print(f"  Time: {t_all_layers:.4f}s")
-    print(f"  Alpha shape: {list(result_all_layers['alpha'].shape)}")
-    print(f"  Beta shape: {list(result_all_layers['beta'].shape)}")
+    print(f"\nAlpha shape: {list(alpha_selected.shape)} (expected: [{len(test_tokens)}, {d_inner}])")
+    print(f"Beta shape: {list(beta_selected.shape)} (expected: [{len(test_tokens)}, {d_inner}, {d_state}])")
     
-    print("\n[2] Extracting layer 0 with original API...")
-    t0 = time.time()
-    result_layer0 = extract_abc(model, tokenizer, args.prompt, layer_idx=0, device=device)
-    alpha_layer0 = calculate_alpha_all_channels(
-        result_layer0['discrete_A'],
-        result_layer0['discrete_B'],
-        result_layer0['C']
-    )
-    beta_layer0 = calculate_beta_all_channels(
-        result_layer0['discrete_A'],
-        result_layer0['C']
-    )
-    t_layer0 = time.time() - t0
-    print(f"  Time: {t_layer0:.4f}s")
-    print(f"  Alpha shape: {list(alpha_layer0.shape)}")
-    print(f"  Beta shape: {list(beta_layer0.shape)}")
+    # Verify alpha matches the full computation
+    print("\nVerifying alpha_selected matches alpha_to_last_fast:")
+    for i, token_idx in enumerate(test_tokens):
+        diff = (alpha_selected[i] - alpha_to_last_fast[token_idx]).abs()
+        print(f"  Token {token_idx}: max diff = {diff.max():.2e}, mean diff = {diff.mean():.2e}")
     
-    print("\n[3] Comparing layer 0 results...")
-    alpha_diff = (result_all_layers['alpha'][0].cpu() - alpha_layer0.cpu()).abs()
-    beta_diff = (result_all_layers['beta'][0].cpu() - beta_layer0.cpu()).abs()
+    # Verify beta relationship: alpha = sum_s(beta * B)
+    print("\nVerifying relationship: alpha = sum_s(beta * B):")
+    for i, token_idx in enumerate(test_tokens):
+        # Reconstruct alpha from beta
+        B_token = result['discrete_B'][0, :, token_idx, :].float()  # [d_inner, d_state]
+        alpha_reconstructed = (beta_selected[i] * B_token).sum(dim=-1)  # [d_inner]
+        diff = (alpha_reconstructed - alpha_selected[i]).abs()
+        print(f"  Token {token_idx}: max diff = {diff.max():.2e}, mean diff = {diff.mean():.2e}")
     
-    print(f"  Alpha max diff: {alpha_diff.max():.2e}")
-    print(f"  Alpha mean diff: {alpha_diff.mean():.2e}")
-    print(f"  Beta max diff: {beta_diff.max():.2e}")
-    print(f"  Beta mean diff: {beta_diff.mean():.2e}")
-    
-    if alpha_diff.max() < 1e-4 and beta_diff.max() < 1e-4:
-        print("  ✓ Layer 0 results match!")
-    else:
-        print("  ⚠ Warning: large difference detected")
-    
-    print("\n[4] Verifying all layers have reasonable values...")
-    num_layers = result_all_layers['alpha'].shape[0]
-    print(f"  Number of layers: {num_layers}")
-    
-    for layer_idx in range(min(3, num_layers)):
-        alpha_layer = result_all_layers['alpha'][layer_idx]
-        beta_layer = result_all_layers['beta'][layer_idx]
-        print(f"  Layer {layer_idx}:")
-        print(f"    Alpha range: [{alpha_layer.min():.2e}, {alpha_layer.max():.2e}]")
-        print(f"    Beta range: [{beta_layer.min():.2e}, {beta_layer.max():.2e}]")
-    
-    print("="*60)
+    print("\n✓ All tests complete!")
+
+
 
