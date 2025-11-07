@@ -226,7 +226,7 @@ def plot_pc_scatter(X_transformed, output_dir, pc_pairs=[(0, 1), (0, 2), (1, 2)]
     plt.close()
 
 
-def save_pca_results(pca, X_transformed, metadata, output_dir, n_components_used):
+def save_pca_results(pca, X_transformed, metadata, output_dir, n_components_used, scaler=None):
     """Save PCA results to files."""
     # Save explained variance
     variance_file = os.path.join(output_dir, 'explained_variance.txt')
@@ -268,6 +268,19 @@ def save_pca_results(pca, X_transformed, metadata, output_dir, n_components_used
     components_file = os.path.join(output_dir, 'pca_components.npy')
     np.save(components_file, pca.components_)
     print(f"Saved PCA components to {components_file}")
+    
+    # Save PCA mean (for centering new data)
+    mean_file = os.path.join(output_dir, 'pca_mean.npy')
+    np.save(mean_file, pca.mean_)
+    print(f"Saved PCA mean to {mean_file}")
+    
+    # Save StandardScaler parameters if used
+    if scaler is not None:
+        scaler_mean_file = os.path.join(output_dir, 'scaler_mean.npy')
+        scaler_scale_file = os.path.join(output_dir, 'scaler_scale.npy')
+        np.save(scaler_mean_file, scaler.mean_)
+        np.save(scaler_scale_file, scaler.scale_)
+        print(f"Saved scaler parameters to {scaler_mean_file} and {scaler_scale_file}")
 
 
 if __name__ == "__main__":
@@ -328,7 +341,7 @@ if __name__ == "__main__":
     
     # Save results
     print("\nStep 5: Saving results...")
-    save_pca_results(pca, X_transformed, metadata, args.output_dir, n_components_used)
+    save_pca_results(pca, X_transformed, metadata, args.output_dir, n_components_used, scaler)
     
     print("\n" + "=" * 70)
     print("ANALYSIS COMPLETE")

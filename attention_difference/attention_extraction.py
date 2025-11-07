@@ -76,6 +76,111 @@ def extract_abc(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
     
     return extracted
 
+def extract_abc_all_layers_fast(model, tokenizer, prompt, device="cuda:0", keep_on_gpu=False):
+    """
+    Extract discrete A, B, C matrices from ALL layers in a SINGLE forward pass.
+    Much faster than calling extract_abc 64 times.
+    
+    Args:
+        model: Mamba model
+        tokenizer: tokenizer
+        prompt: input text OR list of texts (for batch processing)
+        device: device to use
+        keep_on_gpu: if True, keep data on GPU; if False, move to CPU
+    
+    Returns: list of 64 dicts, each with keys [discrete_A, discrete_B, C]
+    """
+    # Handle both single and batch inputs
+    if isinstance(prompt, str):
+        tokens = tokenizer(prompt, return_tensors="pt")
+    else:  # List of prompts (batch)
+        tokens = tokenizer(prompt, return_tensors="pt", padding=True, truncation=False)
+    
+    input_ids = tokens['input_ids'].to(device)
+    
+    extracted_all = []
+    hooks = []
+    
+    def make_extract_hook(layer_idx):
+        def extract_hook(module, input, output):
+            hidden_states = input[0]
+            batch, seqlen, dim = hidden_states.shape
+            
+            # Get x projection
+            xz = rearrange(
+                module.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+                "d (b l) -> b d l",
+                l=seqlen,
+            )
+            if module.in_proj.bias is not None:
+                xz = xz + rearrange(module.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+            
+            x, z = xz.chunk(2, dim=1)
+            
+            if module.activation in ["silu", "swish"]:
+                x = F.silu(module.conv1d(x)[..., :seqlen])
+            
+            # Get dt, B, C
+            x_dbl = module.x_proj(rearrange(x, "b d l -> (b l) d"))
+            dt, B, C = torch.split(x_dbl, [module.dt_rank, module.d_state, module.d_state], dim=-1)
+            
+            dt = module.dt_proj.weight @ dt.t()
+            dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+            if module.dt_proj.bias is not None:
+                dt = dt + module.dt_proj.bias.float().view(1, -1, 1)
+            dt = F.softplus(dt)
+            
+            B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+            C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+            
+            # Compute discrete A and B
+            A = -torch.exp(module.A_log.float())
+            A_expanded = A[None, :, None, :]
+            dt_expanded = dt[:, :, :, None]
+            
+            discrete_A = torch.exp(A_expanded * dt_expanded)
+            discrete_B = dt_expanded * B[:, None, :, :].transpose(2, 3)
+            
+            # Store on GPU or CPU based on flag
+            if keep_on_gpu:
+                extracted_all[layer_idx] = {
+                    'discrete_A': discrete_A,
+                    'discrete_B': discrete_B,
+                    'C': C
+                }
+            else:
+                extracted_all[layer_idx] = {
+                    'discrete_A': discrete_A.cpu(),
+                    'discrete_B': discrete_B.cpu(),
+                    'C': C.cpu()
+                }
+                # Clean up GPU memory only if moving to CPU
+                del discrete_A, discrete_B, C
+            
+            # Always clean up intermediate variables
+            del xz, x, z, x_dbl, dt, B, A, A_expanded, dt_expanded
+        
+        return extract_hook
+    
+    # Register hooks for all 64 layers
+    num_layers = len(model.backbone.layers)
+    extracted_all = [None] * num_layers
+    
+    for layer_idx in range(num_layers):
+        target_layer = model.backbone.layers[layer_idx].mixer
+        hook = target_layer.register_forward_hook(make_extract_hook(layer_idx))
+        hooks.append(hook)
+    
+    # Single forward pass extracts all layers
+    with torch.no_grad():
+        _ = model(input_ids)
+    
+    # Remove all hooks
+    for hook in hooks:
+        hook.remove()
+    
+    return extracted_all
+
 def extract_cummulated_Abar_right(discrete_A):
     """
     Perform the function A => A.scanRight(_ elem-wise product _)
