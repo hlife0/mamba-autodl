@@ -204,7 +204,7 @@ if __name__ == "__main__":
                         last_4_tokens_first_half = list(range(num_first_half_tokens))
                     
                     # All tokens (for alpha)
-                    all_tokens = list(range(seq_len))
+                    all_tokens_of_second_half = list(range(num_first_half_tokens, seq_len))
                     
                     # Process each layer for this sample
                     alpha_all_layers = []
