@@ -229,17 +229,32 @@ class HotpotQAIterator:
     def __getitem__(self, idx: int) -> HotpotQAItem:
         """
         通过索引访问数据条目
-        
+
         Args:
             idx: 索引值
-            
+
         Returns:
             HotpotQAItem 对象
         """
         if idx < 0 or idx >= len(self.data):
             raise IndexError(f"Index {idx} out of range [0, {len(self.data)})")
-        
+
         return self._parse_item(self.data[idx])
+
+    def get_by_id(self, item_id: str) -> Optional[HotpotQAItem]:
+        """
+        通过ID查找数据条目
+
+        Args:
+            item_id: 问题ID
+
+        Returns:
+            HotpotQAItem 对象，如果未找到则返回 None
+        """
+        for raw_item in self.data:
+            if raw_item['_id'] == item_id:
+                return self._parse_item(raw_item)
+        return None
     
     def get_by_type(self, question_type: str) -> 'HotpotQAIterator':
         """
@@ -340,12 +355,44 @@ if __name__ == "__main__":
     print("\n" + "="*80)
     print("测试 2: 使用索引访问第 100 个条目")
     print("="*80)
-    
+
     item = dataset[99]  # 第100个条目（索引从0开始）
-    print(f"\nID: {item.id}")
-    print(f"类型: {item.type}")
-    print(f"难度: {item.level}")
-    print(f"问题: {item.question}")
+
+    print(f"第100个条目的ID: {item.id}")
+
+    # 测试 3: 使用ID访问
+    print("\n" + "="*80)
+    print("测试 3: 使用ID访问条目")
+    print("="*80)
+
+    # 获取第一个条目的ID，然后用ID查找
+    first_item_id = dataset[0].id
+    print(f"第一个条目的ID: {first_item_id}")
+
+    item_by_id = dataset.get_by_id(first_item_id)
+    if item_by_id:
+        print(f"✓ 通过ID找到条目:")
+        print(f"  问题: {item_by_id.question}")
+        print(f"  答案: {item_by_id.answer}")
+        print(f"  类型: {item_by_id.type}")
+        print(f"  难度: {item_by_id.level}")
+    else:
+        print("✗ 通过ID未找到条目")
+
+    # 测试不存在的ID
+    print(f"\n测试不存在的ID:")
+    nonexistent_item = dataset.get_by_id("nonexistent_id_12345")
+    if nonexistent_item:
+        print("意外找到了条目")
+    else:
+        print("✓ 正确返回 None (ID不存在)")
+
+    # 测试 4: 获取特定文档
+    print("\n" + "="*80)
+    print("测试 4: 获取特定文档内容")
+    print("="*80)
+
+    item = dataset[0]
     print(f"答案: {item.answer}")
     
     # 测试 3: 获取特定文档
