@@ -6,8 +6,8 @@ from hotpot import HotpotQAIterator
 
 # Add mamba to path
 sys.path.insert(0, '../mamba')
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.utils.generation import InferenceParams
+from mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba.mamba_ssm.utils.generation import InferenceParams
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
@@ -57,7 +57,7 @@ class HotpotDoc1CacheIterator:
     HotpotQA Doc1 Cache Iterator for Mamba
     """
 
-    def __init__(self, json_path, gpu_id=0, num_samples=10, random_seed=42):
+    def __init__(self, json_path, gpu_id=0, num_samples=10, random_seed=42, external_model=None, external_tokenizer=None):
         self._index = 0
 
         # Tackle sampling and random seed
@@ -68,10 +68,19 @@ class HotpotDoc1CacheIterator:
         # Record device
         self.device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
 
-        # Load model and tokenizer
-        self.model = MambaLMHeadModel.from_pretrained("state-spaces/mamba-2.8b", device=self.device)
-        self.model.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+        # Use external model/tokenizer if provided, otherwise load own
+        if external_model is not None and external_tokenizer is not None:
+            self.model = external_model
+            self.tokenizer = external_tokenizer
+            self.owns_model = False
+            print(f"Using external model on {self.device}")
+        else:
+            # Load model and tokenizer
+            self.model = MambaLMHeadModel.from_pretrained("state-spaces/mamba-2.8b", device=self.device)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+            self.owns_model = True
+            print(f"✓ Model loaded on {self.device} (GPU {gpu_id})")
 
     def create_doc1_prompt(self, item):
         doc1 = item.context[0]

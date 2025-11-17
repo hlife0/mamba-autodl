@@ -1,138 +1,167 @@
-#!/usr/bin/env python3
-"""
-GPU-optimized training script for SSM state transformation using single Mamba model
-Shared model approach to avoid memory issues
-"""
-
 import sys
 import os
+from typing import Dict
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import argparse
 
-from models import SimpleSSMTransformer
-from dataset.hotpot_ssm_state import extract_cache_single
-
-
-def prepare_cache_2(device, gpu_id):
-    """
-    Prepare doc2 cache for the fixed document
-    Returns: (mamba_model, tokenizer, doc2_cache, doc2_content)
-    """
-    fixed_doc2_id = "5a7a06935542990198eaf050"
-
-    # Get fixed doc2
-    from dataset.hotpot import HotpotQAIterator
-    hotpot_iterator = HotpotQAIterator("dataset/HotpotQA/hotpot_train_v1.1.json")
-    fixed_doc2_item = hotpot_iterator.get_by_id(fixed_doc2_id)
-
-    if not fixed_doc2_item or len(fixed_doc2_item.context) < 2:
-        raise ValueError(f"Fixed doc2 ID {fixed_doc2_id} not found or has no doc2")
-
-    doc2_content = f"Document 2: {fixed_doc2_item.context[1].title}\n{fixed_doc2_item.context[1].get_full_text()}\n\n"
-    print(f"Using fixed doc2: {fixed_doc2_item.context[1].title}")
-
-    # Load Mamba model and tokenizer
-    print("Loading Mamba model...")
-    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-    from transformers import AutoTokenizer
-
-    mamba_model = MambaLMHeadModel.from_pretrained("state-spaces/mamba-2.8b", device=device)
-    mamba_model.eval()
-    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
-
-    # Pre-compute doc2 cache once
-    print("Pre-computing doc2 cache...")
-    doc2_cache = extract_cache_single(mamba_model, tokenizer, doc2_content, device=device)
-    print(f"Doc2 cache computed: {doc2_cache.shape}")
-
-    return mamba_model, tokenizer, doc2_cache, doc2_content, hotpot_iterator
-
+from mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from transformers import AutoTokenizer
+from models import SimpleMLP
+from dataset.hotpot import HotpotQAIterator
+from dataset.hotpot_ssm_state import HotpotDoc1CacheIterator, HotpotDoc1PlusCacheIterator
+from utils import COMPARISON_FIXED_ID, generate_doc1_prompt, generate_doc2_prompt, generate_doc12_prompt, extract_cache_single
 
 if __name__ == "__main__":
-    print("Starting training with shared Mamba model...")
+    parser = argparse.ArgumentParser(description="Train SSM state transformation model")
+    parser.add_argument("--fixed_doc2_id", type=str, default=COMPARISON_FIXED_ID, help="Fixed doc2 ID for cache preparation")
+    parser.add_argument("--exp_name", type=str, default="dbg", help="Experiment name for saving models")
+    parser.add_argument("--gpu_train", type=int, default=2, help="GPU for training transformer")
+    parser.add_argument("--gpu_mamba", type=int, default=3, help="GPU for Mamba model and data generation")
+    parser.add_argument("--num_samples", type=int, default=200, help="Number of training samples")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--save_dir", type=str, default="/home/hlife/Mamba-experiment/transformation_models/experiments", help="Directory to save models")
 
-    # Configuration
-    num_samples = 10
-    num_epochs = 3
-    gpu_id = 2
+    args = parser.parse_args()
 
-    # Clear GPU memory
+    print("Starting training with existing iterators...")
+    print(f"Experiment: {args.exp_name}")
+    print(f"Training GPU: {args.gpu_train}, Mamba GPU: {args.gpu_mamba}")
+    print(f"Samples: {args.num_samples}, Epochs: {args.num_epochs}, Batch Size: {args.batch_size}")
+
+    # Create save directory
+    os.makedirs(args.save_dir, exist_ok=True)
+    save_path = os.path.join(args.save_dir, f"{args.exp_name}_model.pth")
+
+    # Clear GPU memory for Mamba GPU
     torch.cuda.empty_cache()
-    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
 
-    # Prepare doc2 cache and get hotpot_iterator
-    mamba_model, tokenizer, doc2_cache, doc2_content, hotpot_iterator = prepare_cache_2(device, gpu_id)
+    # Set up devices
+    mamba_device = f"cuda:{args.gpu_mamba}" if torch.cuda.is_available() else "cpu"
+    train_device = f"cuda:{args.gpu_train}" if torch.cuda.is_available() else "cpu"
+    mamba_model = MambaLMHeadModel.from_pretrained("state-spaces/mamba-2.8b", device=mamba_device)
+    mamba_tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 
-    # Create training model
-    transformer_model = SimpleSSMTransformer().to(device)
-    optimizer = optim.Adam(transformer_model.parameters(), lr=1e-5)
+    # prepare fixed doc2 content and cache
+    doc2_item_useful = HotpotQAIterator("dataset/HotpotQA/hotpot_train_v1.1.json").get_by_id(args.fixed_doc2_id).get_useful()
+    doc2_prompt = generate_doc2_prompt(doc2_item_useful)
+    doc2_cache = extract_cache_single(mamba_model, mamba_tokenizer, doc2_prompt, device=mamba_device, return_tensor=True)
+    doc2_cache = doc2_cache.to(train_device)
+
+    # Create iterators using existing classes
+    print("Creating iterators...")
+    doc1_iterator = HotpotDoc1CacheIterator(
+        "dataset/HotpotQA/hotpot_train_v1.1.json",
+        gpu_id=args.gpu_mamba,
+        num_samples=args.num_samples,
+        random_seed=args.random_seed,
+        external_model=mamba_model,
+        external_tokenizer=mamba_tokenizer
+    )
+
+    doc1_plus_iterator = HotpotDoc1PlusCacheIterator(
+        "dataset/HotpotQA/hotpot_train_v1.1.json",
+        plus_content=doc2_prompt,
+        gpu_id=args.gpu_mamba,
+        num_samples=args.num_samples,
+        random_seed=args.random_seed,
+        external_model=mamba_model,
+        external_tokenizer=mamba_tokenizer
+    )
+
+    # Create training model on training GPU
+    transformer_model = SimpleMLP().to(train_device)
+    optimizer = optim.Adam(transformer_model.parameters(), lr=args.learning_rate)
     criterion = nn.MSELoss()
 
     print(f"Transformer model parameters: {sum(p.numel() for p in transformer_model.parameters()):,}")
+    print(f"Effective batch size: {args.batch_size}")
 
-    # Get sample indices (use fixed random seed)
-    import random
-    random.seed(42)
-    sample_indices = random.sample(range(len(hotpot_iterator)), num_samples)
-
-    print(f"Selected {num_samples} random samples for training")
-
-    # Training loop
-    for epoch in range(num_epochs):
+    # Training loop using iterators with real batching
+    for epoch in range(args.num_epochs):
         transformer_model.train()
         total_loss = 0.0
+        num_batches = 0
 
-        for sample_idx, i in enumerate(sample_indices):
-            # Get item directly
-            item = hotpot_iterator[i]
-            if item.id == "5a7a06935542990198eaf050":  # Fixed doc2 ID
-                continue
+        # Collect batches
+        batch_doc1 = []
+        batch_doc1_plus = []
 
-            # Create doc1 content
-            doc1_content = f"Document 1: {item.context[0].title}\n{item.context[0].get_full_text()}\n\n"
+        for doc1_cache, doc1_plus_cache in zip(doc1_iterator, doc1_plus_iterator):
+            # Move to training GPU
+            doc1_cache = doc1_cache.to(train_device)
+            doc1_plus_cache = doc1_plus_cache.to(train_device)
 
-            # Get doc1 cache using shared model
-            doc1_cache = extract_cache_single(mamba_model, tokenizer, doc1_content, device=device)
+            batch_doc1.append(doc1_cache)
+            batch_doc1_plus.append(doc1_plus_cache)
 
-            # Get doc1+doc2 cache using shared model
-            combined_content = doc1_content + doc2_content
-            combined_cache = extract_cache_single(mamba_model, tokenizer, combined_content, device=device)
+            # When batch is full, process it
+            if len(batch_doc1) >= args.batch_size:
+                # Stack to create batch tensors
+                doc1_batch = torch.stack(batch_doc1)  # [batch_size, 64, 5120, 16]
+                doc1_plus_batch = torch.stack(batch_doc1_plus)
 
-            # Calculate target difference: (doc1+doc2) - doc2
-            target_diff = combined_cache - doc2_cache
+                # Calculate target difference: (doc1+doc2) - doc2
+                target_diff = doc1_plus_batch - doc2_cache.unsqueeze(0)
 
-            # Training step
+                # Training step
+                optimizer.zero_grad()
+
+                predicted_diff = transformer_model(doc1_batch)
+                loss = criterion(predicted_diff, target_diff)
+
+  
+                # Check for NaN
+                if torch.isnan(loss):
+                    print(f"⚠️ NaN detected in loss at batch {num_batches}")
+                    break
+
+                loss.backward()
+
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(transformer_model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+                # Clear batch
+                batch_doc1 = []
+                batch_doc1_plus = []
+
+                if num_batches % 5 == 0:
+                    print(f"  Batch {num_batches}, Loss: {loss.item():.6f}")
+
+        # Process remaining items in last incomplete batch
+        if len(batch_doc1) > 0:
+            doc1_batch = torch.stack(batch_doc1)
+            doc1_plus_batch = torch.stack(batch_doc1_plus)
+            target_diff = doc1_plus_batch - doc2_cache.unsqueeze(0)
+
             optimizer.zero_grad()
-
-            # Add batch dimension
-            doc1_batch = doc1_cache.unsqueeze(0)
-            target_batch = target_diff.unsqueeze(0)
-
             predicted_diff = transformer_model(doc1_batch)
-            loss = criterion(predicted_diff, target_batch)
+            loss = criterion(predicted_diff, target_diff)
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(transformer_model.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
+            num_batches += 1
 
-            if sample_idx % 10 == 0:
-                print(f"  Sample {sample_idx+1}/{num_samples}, Loss: {loss.item():.6f}")
-
-            # Clear intermediate tensors
-            del doc1_cache, combined_cache, target_diff
-            del doc1_batch, target_batch, predicted_diff, loss
-
-        avg_loss = total_loss / num_samples
-        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
+        print(f"Epoch {epoch+1}/{args.num_epochs}, Average Loss: {avg_loss:.6f}, Batches: {num_batches}")
 
         # Clear cache between epochs
         torch.cuda.empty_cache()
 
     # Save model
-    torch.save(transformer_model.state_dict(), "ssm_transformer_shared.pth")
-    print("Training completed! Model saved to ssm_transformer_shared.pth")
+    torch.save(transformer_model.state_dict(), save_path)
+    print(f"Training completed! Model saved to {save_path}")

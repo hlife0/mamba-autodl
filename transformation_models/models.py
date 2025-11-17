@@ -10,25 +10,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SimpleSSMTransformer(nn.Module):
+class SimpleMLP(nn.Module):
     """
-    Simple 2-3 layer FFNN to transform SSM states
+    Simple MLP to transform SSM states
     """
 
-    def __init__(self, input_dim=64*5120*16, hidden_dims=[512], output_dim=64*5120*16):
-        super(SimpleSSMTransformer, self).__init__()
+    def __init__(self, input_dim=64*5120*16, hidden_dims=[128], output_dim=64*5120*16):
+        super(SimpleMLP, self).__init__()
 
         layers = []
         prev_dim = input_dim
 
         # Hidden layers
         for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
+            linear = nn.Linear(prev_dim, hidden_dim)
+            # Better weight initialization
+            nn.init.xavier_uniform_(linear.weight)
+            nn.init.zeros_(linear.bias)
+            layers.append(linear)
             layers.append(nn.ReLU())
             prev_dim = hidden_dim
 
         # Output layer
-        layers.append(nn.Linear(prev_dim, output_dim))
+        output_linear = nn.Linear(prev_dim, output_dim)
+        # Normal initialization for output layer
+        nn.init.xavier_uniform_(output_linear.weight)
+        nn.init.zeros_(output_linear.bias)
+        layers.append(output_linear)
 
         self.network = nn.Sequential(*layers)
 
@@ -54,14 +62,14 @@ class SimpleSSMTransformer(nn.Module):
 
 def create_model():
     """Create and return the model"""
-    return SimpleSSMTransformer()
+    return SimpleMLP()
 
 
 if __name__ == "__main__":
     device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = create_model().to(device)
+    model = SimpleMLP().to(device)
     model.eval()
 
     batch_size = 2
