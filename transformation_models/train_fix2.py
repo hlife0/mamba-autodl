@@ -1,5 +1,6 @@
 import sys
 import os
+import logging
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import torch
@@ -31,16 +32,29 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    print("Starting training with existing iterators...")
-    print(f"Experiment: {args.exp_name}")
-    print(f"Training GPU: {args.gpu_train}, Mamba GPU: {args.gpu_mamba}")
-    print(f"Samples: {args.num_samples}, Epochs: {args.num_epochs}, Batch Size: {args.batch_size}")
-    print(f"Evaluation split: {args.eval_percent}%")
-    print(f"Scale factor: {args.scale_factor}")
+    # Create experiment directory structure
+    exp_dir = os.path.join(args.save_dir, args.exp_name)
+    os.makedirs(exp_dir, exist_ok=True)
 
-    # Create save directory
-    os.makedirs(args.save_dir, exist_ok=True)
-    save_path = os.path.join(args.save_dir, f"{args.exp_name}_model.pth")
+    # Set up logging
+    log_file = os.path.join(exp_dir, "train.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    logger.info("Starting training with existing iterators...")
+    logger.info(f"Experiment: {args.exp_name}")
+    logger.info(f"Training GPU: {args.gpu_train}, Mamba GPU: {args.gpu_mamba}")
+    logger.info(f"Samples: {args.num_samples}, Epochs: {args.num_epochs}, Batch Size: {args.batch_size}")
+    logger.info(f"Evaluation split: {args.eval_percent}%")
+    logger.info(f"Scale factor: {args.scale_factor}")
+    logger.info(f"Experiment directory: {exp_dir}")
 
     # Clear GPU memory for Mamba GPU
     torch.cuda.empty_cache()
@@ -62,10 +76,10 @@ if __name__ == "__main__":
     eval_samples = int(total_samples * args.eval_percent / 100)
     train_samples = total_samples - eval_samples
 
-    print(f"Splitting data: {train_samples} training, {eval_samples} evaluation samples")
+    logger.info(f"Splitting data: {train_samples} training, {eval_samples} evaluation samples")
 
     # Create iterators using existing classes
-    print("Creating iterators...")
+    logger.info("Creating iterators...")
 
     # Training iterators (only training samples)
     doc1_train_iterator = HotpotDoc1CacheIterator(
@@ -87,18 +101,31 @@ if __name__ == "__main__":
         external_tokenizer=mamba_tokenizer
     )
 
-    print(f"Created training iterators with {len(doc1_train_iterator)} samples each")
+    logger.info(f"Created training iterators with {len(doc1_train_iterator)} samples each")
 
     # Create training model on training GPU
     transformer_model = SimpleMLP().to(train_device)
     optimizer = optim.Adam(transformer_model.parameters(), lr=args.learning_rate)
     criterion = nn.MSELoss()
 
-    print(f"Training model parameters: {sum(p.numel() for p in transformer_model.parameters()):,}")
-    print(f"Effective batch size: {args.batch_size}")
+    # Save model architecture
+    model_arch_path = os.path.join(exp_dir, "model_architecture.txt")
+    with open(model_arch_path, 'w') as f:
+        f.write(str(transformer_model))
+    logger.info(f"Model architecture saved to {model_arch_path}")
+
+    # Save model as pickle for easy loading
+    import pickle
+    model_pickle_path = os.path.join(exp_dir, "model.pkl")
+    with open(model_pickle_path, 'wb') as f:
+        pickle.dump(transformer_model, f)
+    logger.info(f"Model structure saved to {model_pickle_path}")
+
+    logger.info(f"Training model parameters: {sum(p.numel() for p in transformer_model.parameters()):,}")
+    logger.info(f"Effective batch size: {args.batch_size}")
 
     # Streaming approach: evaluate by skipping training samples
-    print(f"Split setup: {train_samples} training, {eval_samples} evaluation samples")
+    logger.info(f"Split setup: {train_samples} training, {eval_samples} evaluation samples")
 
     def stream_evaluation(model, skip_samples, eval_samples):
         """Stream evaluation data without loading all into memory"""
@@ -212,7 +239,7 @@ if __name__ == "__main__":
 
                 # Check for NaN
                 if torch.isnan(loss):
-                    print(f"⚠️ NaN detected in loss at batch {num_batches}")
+                    logger.warning(f"⚠️ NaN detected in loss at batch {num_batches}")
                     break
 
                 loss.backward()
@@ -230,7 +257,7 @@ if __name__ == "__main__":
                 batch_doc1_plus = []
 
                 if num_batches % 5 == 0:
-                    print(f"  Batch {num_batches}, Loss: {loss.item():.6f}")
+                    logger.info(f"  Batch {num_batches}, Loss: {loss.item():.6f}")
 
         # Process remaining items in last incomplete batch
         if len(batch_doc1) > 0:
@@ -253,18 +280,29 @@ if __name__ == "__main__":
             num_batches += 1
 
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
-        print(f"Epoch {epoch+1}/{args.num_epochs}, Training Loss: {avg_train_loss:.6f}, Batches: {num_batches}")
+        logger.info(f"Epoch {epoch+1}/{args.num_epochs}, Training Loss: {avg_train_loss:.6f}, Batches: {num_batches}")
+
+        # Save checkpoint for each epoch
+        if (epoch + 1) % 5 == 0:
+            checkpoint_path = os.path.join(exp_dir, f"checkpoint_{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': transformer_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': avg_train_loss,
+                'scale_factor': args.scale_factor
+            }, checkpoint_path)
+            logger.info(f"Checkpoint saved to {checkpoint_path}")
 
         # Evaluation using streaming approach
         if eval_samples > 0:
             eval_loss = stream_evaluation(transformer_model, train_samples, eval_samples)
-            print(f"  Evaluation Loss: {eval_loss:.6f}")
+            logger.info(f"  Evaluation Loss: {eval_loss:.6f}")
         else:
-            print("  No evaluation data available")
+            logger.info("  No evaluation data available")
 
         # Clear cache between epochs
         torch.cuda.empty_cache()
 
-    # Save model
-    torch.save(transformer_model.state_dict(), save_path)
-    print(f"Training completed! Model saved to {save_path}")
+    logger.info("Training completed!")
+    logger.info(f"All checkpoints saved in {exp_dir}")
