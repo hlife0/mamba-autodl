@@ -257,6 +257,61 @@ class HotpotPlusDoc2CacheIterator:
 
     def __len__(self):
         return len(self.hotpot_iterator)
+    
+class HotpotDoc1Doc2CacheIterator:
+    def __init__(self, json_path, plus_content, gpu_id=0, num_samples=10, random_seed=42, external_model=None, external_tokenizer=None):
+        self._index = 0
+
+        self.plus_content = plus_content
+
+        # Tackle sampling and random seed
+        self.num_samples = num_samples
+        self.random_seed = random_seed
+        self.hotpot_iterator = HotpotQAIterator(json_path).random_choose(num_samples, seed=random_seed)
+
+        # Record device
+        self.device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+
+        # Use external model/tokenizer if provided, otherwise load own
+        if external_model is not None and external_tokenizer is not None:
+            self.model = external_model
+            self.tokenizer = external_tokenizer
+            self.owns_model = False
+        else:
+            # Load model and tokenizer
+            self.model = MambaLMHeadModel.from_pretrained("state-spaces/mamba-2.8b", device=self.device)
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+            self.owns_model = True
+
+    def create_doc1_prompt(self, item):
+        doc1 = item.context[0]
+        return f"Document 1: {doc1.title}\n{doc1.get_full_text()}\n\n"
+
+    def create_doc2_prompt(self, item):
+        doc2 = item.context[1]
+        return f"Document 2: {doc2.title}\n{doc2.get_full_text()}\n\n"
+
+    def extract_doc1_doc2_cache(self, item):
+        prompt = self.create_doc1_prompt(item) + self.create_doc2_prompt(item)
+        cache_tensor = extract_cache_single(self.model, self.tokenizer, prompt, device=self.device, return_tensor=True)
+        return cache_tensor
+
+    def __iter__(self):
+        self._index = 0
+        return self
+
+    def __next__(self):
+        if self._index >= len(self.hotpot_iterator):
+            raise StopIteration
+
+        item = self.hotpot_iterator[self._index]
+        self._index += 1
+
+        return self.extract_doc1_doc2_cache(item)
+
+    def __len__(self):
+        return len(self.hotpot_iterator)
 
 if __name__ == "__main__":
     json_path = "dataset/HotpotQA/hotpot_train_v1.1.json"
