@@ -31,7 +31,7 @@ def build_prompt(question, doc1, doc2):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect cache differences")
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-130m', help='Model name or path')
     parser.add_argument('--tokenizer_name', type=str, default='EleutherAI/gpt-neox-20b', help='Tokenizer name')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
@@ -39,7 +39,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_partial_samples', type=int, default=100, help='Number of partial samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--output_dir', type=str, default='./attention_difference/experiments', help='Output directory')
-    parser.add_argument('--experiment_name', type=str, default='alpha_beta_stats', help='Experiment name')
+    parser.add_argument('--experiment_name', type=str, default='alpha_beta_stats-130M', help='Experiment name')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size for parallel processing (default: 2, max recommended: 2)')
     args = parser.parse_args()
     
@@ -75,7 +75,17 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
     model = MambaLMHeadModel.from_pretrained(args.model_path, device=device, dtype=dtype)
     model.eval()
-    print("✓ Model loaded successfully\n")
+    print("✓ Model loaded successfully")
+    
+    # Extract model dimensions
+    n_layer = len(model.backbone.layers)
+    d_inner = model.backbone.layers[0].mixer.d_inner
+    d_state = model.backbone.layers[0].mixer.d_state
+    print(f"\nModel Architecture:")
+    print(f"  Number of layers: {n_layer}")
+    print(f"  d_inner: {d_inner}")
+    print(f"  d_state: {d_state}")
+    print()
     
     # Load dataset
     dataset = HotpotQAIterator(args.data_path)
@@ -105,6 +115,7 @@ if __name__ == "__main__":
         partial_doc2_samples.append({
             'doc_with_title': "[" + docs[1]['title'] + "] " + docs[1]['content'],
             'doc_id': item.id,
+            'question': item.question
         })
         count_partial += 1
         if count_partial >= args.num_partial_samples:
@@ -127,7 +138,6 @@ if __name__ == "__main__":
     pbar_doc2 = tqdm(total=len(partial_doc2_samples), desc="Processing doc2 (partial)")
     
     for doc2_sample in partial_doc2_samples:
-        doc2_with_title = doc2_sample['doc_with_title']
         doc2_id = doc2_sample['doc_id']
         
         # Clear GPU cache before processing new doc2
@@ -138,9 +148,9 @@ if __name__ == "__main__":
         all_pairs_for_doc2 = []
         for doc1_sample in all_doc1_samples:
             first_half, second_half, len_first_half, len_second_half = build_prompt(
-                doc1_sample['question'], 
+                doc2_sample['question'], 
                 doc1_sample['doc_with_title'], 
-                doc2_with_title
+                doc2_sample['doc_with_title']
             )
             full_prompt = first_half + second_half
             
@@ -148,9 +158,7 @@ if __name__ == "__main__":
                 'full_prompt': full_prompt,
                 'first_half': first_half,
                 'doc1_id': doc1_sample['doc_id'],
-                'question': doc1_sample['question'],
-                'len_first_half': len_first_half,
-                'len_second_half': len_second_half,
+                'question': doc2_sample['question']
             })
         
         # Online computation of mean and variance (Welford's algorithm)
@@ -175,6 +183,7 @@ if __name__ == "__main__":
                 # Tokenize all prompts in batch (with padding)
                 prompts = [pair['full_prompt'] for pair in batch_pairs]
                 first_halves = [pair['first_half'] for pair in batch_pairs]
+                questions = [f"Q: {pair['question']}\n\nA:" for pair in batch_pairs]
                 
                 # Get tokenized sequences
                 batch_tokens = tokenizer(prompts, return_tensors="pt", padding=True, truncation=False)
@@ -188,7 +197,7 @@ if __name__ == "__main__":
                 first_half_tokens_batch = tokenizer(first_halves, return_tensors="pt", padding=True)
                 num_first_half_tokens_list = first_half_tokens_batch['attention_mask'].sum(dim=1).tolist()
                 
-                # Extract ABC for ALL 64 layers in a SINGLE forward pass for the ENTIRE BATCH
+                # Extract ABC for ALL layers in a SINGLE forward pass for the ENTIRE BATCH
                 extracted_all_layers = extract_abc_all_layers_fast(model, tokenizer, prompts, device=device, keep_on_gpu=True)
                 
                 # Process each sample in the batch
@@ -221,7 +230,7 @@ if __name__ == "__main__":
                         Abar = extract_cummulated_Abar_right(discrete_A)
                         
                         # Extract alpha: all tokens → last token [seqlen, d_inner]
-                        alpha = extract_alpha_last(Abar, discrete_B, C, all_tokens)
+                        alpha = extract_alpha_last(Abar, discrete_B, C, all_tokens_of_second_half)
                         alpha_all_layers.append(alpha.cpu())
                         
                         # Extract beta: last 4 tokens of first_half → last token
@@ -232,8 +241,8 @@ if __name__ == "__main__":
                         del discrete_A, discrete_B, C, Abar, alpha, beta
                     
                     # Stack all layers
-                    alpha_stacked = torch.stack(alpha_all_layers, dim=0).float()  # [64, seqlen, d_inner]
-                    beta_stacked = torch.stack(beta_all_layers, dim=0).float()    # [64, 4, d_inner, d_state]
+                    alpha_stacked = torch.stack(alpha_all_layers, dim=0).float()  # [n_layer, seqlen, d_inner]
+                    beta_stacked = torch.stack(beta_all_layers, dim=0).float()    # [n_layer, 4, d_inner, d_state]
                     del alpha_all_layers, beta_all_layers
                     
                     # Update max_seqlen
@@ -245,14 +254,14 @@ if __name__ == "__main__":
                             if current_seqlen > old_seqlen:
                                 # Pad previous statistics
                                 pad_size = current_seqlen - old_seqlen
-                                alpha_mean = torch.cat([alpha_mean, torch.zeros(64, pad_size, 5120)], dim=1)
-                                alpha_M2 = torch.cat([alpha_M2, torch.zeros(64, pad_size, 5120)], dim=1)
+                                alpha_mean = torch.cat([alpha_mean, torch.zeros(n_layer, pad_size, d_inner)], dim=1)
+                                alpha_M2 = torch.cat([alpha_M2, torch.zeros(n_layer, pad_size, d_inner)], dim=1)
                         max_seqlen = current_seqlen
                     
                     # Pad current alpha if needed
                     if current_seqlen < max_seqlen:
                         pad_size = max_seqlen - current_seqlen
-                        alpha_stacked = torch.cat([alpha_stacked, torch.zeros(64, pad_size, 5120)], dim=1)
+                        alpha_stacked = torch.cat([alpha_stacked, torch.zeros(n_layer, pad_size, d_inner)], dim=1)
                     
                     # Welford's online algorithm for mean and variance
                     count += 1

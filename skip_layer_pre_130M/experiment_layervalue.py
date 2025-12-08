@@ -1,6 +1,5 @@
 import sys
 import os
-
 # Add parent directory to path to import dataset module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -11,7 +10,7 @@ import torch
 from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from dataset.hotpot import HotpotQAIterator
-from skip_layer_pre.utils import inference_logic
+from skip_layer_pre_130M.utils import inference_logic
 from tqdm import tqdm
 
 
@@ -62,13 +61,13 @@ def layervalue_hybrid_logic(ssm_fast_stack, ssm_slow_stack, top_k_percent=10.0):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Layer-wise value-level hybrid cache experiment: per-layer top-k% largest value differences")
     parser.add_argument('--top_k_percent', type=float, default=10.0, help='Percentage of values per layer with largest differences to use slow cache')
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-130m', help='Model name or path')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
-    parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples')
+    parser.add_argument('--num_samples', type=int, default=10, help='Number of samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--max_new_tokens', type=int, default=30, help='Max tokens to generate')
-    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre/experiments', help='Output directory')
+    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre_130M/experiments', help='Output directory')
     args = parser.parse_args()
     
     device = args.device

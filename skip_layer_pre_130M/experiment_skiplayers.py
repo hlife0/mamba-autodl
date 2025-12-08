@@ -1,6 +1,5 @@
 import sys
 import os
-
 # Add parent directory to path to import dataset module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -11,44 +10,44 @@ import torch
 from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from dataset.hotpot import HotpotQAIterator
-from skip_layer_pre.utils import inference_logic
+from skip_layer_pre_130M.utils import inference_logic
 from tqdm import tqdm
 
 
-def skip_last_layer_hybrid_logic(ssm_fast_stack, ssm_slow_stack, skip_last_layers=14):
+def skip_layer_hybrid_logic(ssm_fast_stack, ssm_slow_stack, skip_layers=30):
     """
-    Skip last N layers: use slow cache for layers [0, -skip_last_layers), fast cache for layers [-skip_last_layers, end].
+    Skip first N layers: use fast cache for layers [0, skip_layers), slow cache for layers [skip_layers, end].
     
     Args:
         ssm_fast_stack: Fast cache SSM states [num_layers, batch, d_inner, d_state]
         ssm_slow_stack: Slow cache SSM states [num_layers, batch, d_inner, d_state]
-        skip_last_layers: Number of last layers to use fast cache (default: 14)
+        skip_layers: Number of initial layers to use fast cache (default: 30)
         
     Returns:
         ssm_hybrid_stack: Mixed SSM states [num_layers, batch, d_inner, d_state]
     """
     num_layers = ssm_fast_stack.shape[0]
-    skip_last_layers = min(skip_last_layers, num_layers)  # Ensure skip_last_layers doesn't exceed total layers
+    skip_layers = min(skip_layers, num_layers)  # Ensure skip_layers doesn't exceed total layers
     
     # Clone slow stack as base
     ssm_hybrid_stack = ssm_slow_stack.clone()
     
-    # Replace last skip_last_layers with fast cache
-    ssm_hybrid_stack[-skip_last_layers:] = ssm_fast_stack[-skip_last_layers:]
+    # Replace first skip_layers with fast cache
+    ssm_hybrid_stack[:skip_layers] = ssm_fast_stack[:skip_layers]
     
     return ssm_hybrid_stack
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Skip-last-layer hybrid cache experiment: last N layers use fast cache, rest use slow cache")
-    parser.add_argument('--skip_last_layers', type=int, default=14, help='Number of last layers to use fast cache')
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
+    parser = argparse.ArgumentParser(description="Skip-layer hybrid cache experiment: first N layers use fast cache, rest use slow cache")
+    parser.add_argument('--skip_layers', type=int, default=30, help='Number of initial layers to use fast cache')
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-130m', help='Model name or path')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
-    parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples')
+    parser.add_argument('--num_samples', type=int, default=10, help='Number of samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--max_new_tokens', type=int, default=14, help='Max tokens to generate')
-    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre/experiments', help='Output directory')
+    parser.add_argument('--max_new_tokens', type=int, default=30, help='Max tokens to generate')
+    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre_130M/experiments', help='Output directory')
     args = parser.parse_args()
     
     device = args.device
@@ -56,7 +55,7 @@ if __name__ == "__main__":
     
     print(f"Loading model: {args.model_path}")
     print(f"Device: {device}")
-    print(f"Skip last layers: {args.skip_last_layers} (last {args.skip_last_layers} layers use fast cache)\n")
+    print(f"Skip layers: {args.skip_layers} (first {args.skip_layers} layers use fast cache)\n")
     
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     if tokenizer.pad_token is None:
@@ -67,11 +66,11 @@ if __name__ == "__main__":
     print(f"✓ Model loaded successfully\n")
     
     print("=" * 70)
-    print("SKIP LAST LAYER HYBRID CACHE")
+    print("SKIP LAYER HYBRID CACHE")
     print("=" * 70)
     print(f"Dataset: {args.data_path}")
     print(f"Samples: {args.num_samples}")
-    print(f"Skip last layers: {args.skip_last_layers} (last {args.skip_last_layers} layers use fast cache)")
+    print(f"Skip layers: {args.skip_layers} (first {args.skip_layers} layers use fast cache)")
     print(f"Max new tokens: {args.max_new_tokens}")
     print(f"Seed: {args.seed}")
     print()
@@ -81,7 +80,7 @@ if __name__ == "__main__":
     
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%d%H%M%S")
-    output_file = os.path.join(args.output_dir, f"skiplastlayers{args.skip_last_layers}_{timestamp}.csv")
+    output_file = os.path.join(args.output_dir, f"skiplayers{args.skip_layers}_{timestamp}.csv")
     
     fieldnames = ['id', 'decoded', 'answer', 'question', 'doc1_title', 'doc2_title', 'doc1_content', 'doc2_content']
     
@@ -100,9 +99,9 @@ if __name__ == "__main__":
             doc2_with_title = docs[1]['title'] + ": " + docs[1]['content']
             
             try:
-                # Create hybrid logic with skip_last_layers parameter
+                # Create hybrid logic with skip_layers parameter
                 def hybrid_logic_func(fast, slow):
-                    return skip_last_layer_hybrid_logic(fast, slow, skip_last_layers=args.skip_last_layers)
+                    return skip_layer_hybrid_logic(fast, slow, skip_layers=args.skip_layers)
                 
                 decoded = inference_logic(
                     model=model,

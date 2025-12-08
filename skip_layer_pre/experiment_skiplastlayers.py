@@ -15,14 +15,14 @@ from skip_layer_pre.utils import inference_logic
 from tqdm import tqdm
 
 
-def skip_last_layer_hybrid_logic(ssm_fast_stack, ssm_slow_stack, skip_last_layers=14):
+def skip_last_layer_hybrid_logic(ssm_fast_stack, ssm_slow_stack, skip_last_layers=1):
     """
     Skip last N layers: use slow cache for layers [0, -skip_last_layers), fast cache for layers [-skip_last_layers, end].
     
     Args:
         ssm_fast_stack: Fast cache SSM states [num_layers, batch, d_inner, d_state]
         ssm_slow_stack: Slow cache SSM states [num_layers, batch, d_inner, d_state]
-        skip_last_layers: Number of last layers to use fast cache (default: 14)
+        skip_last_layers: Number of last layers to use fast cache (default: 1)
         
     Returns:
         ssm_hybrid_stack: Mixed SSM states [num_layers, batch, d_inner, d_state]
@@ -41,13 +41,13 @@ def skip_last_layer_hybrid_logic(ssm_fast_stack, ssm_slow_stack, skip_last_layer
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Skip-last-layer hybrid cache experiment: last N layers use fast cache, rest use slow cache")
-    parser.add_argument('--skip_last_layers', type=int, default=14, help='Number of last layers to use fast cache')
+    parser.add_argument('--skip_last_layers', type=int, default=1, help='Number of last layers to use fast cache')
     parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
     parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--max_new_tokens', type=int, default=14, help='Max tokens to generate')
+    parser.add_argument('--max_new_tokens', type=int, default=30, help='Max tokens to generate')
     parser.add_argument('--output_dir', type=str, default='./skip_layer_pre/experiments', help='Output directory')
     args = parser.parse_args()
     

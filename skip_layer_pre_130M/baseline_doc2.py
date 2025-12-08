@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full baseline: Doc1 + Doc2 + Few-shot + Question.
+Doc2 baseline: Doc2 + Few-shot + Question.
 """
 
 import sys
@@ -14,27 +14,27 @@ import torch
 from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from dataset.hotpot import HotpotQAIterator
-from skip_layer_pre.utils import inference_logic
+from utils import inference_logic
 from tqdm import tqdm
 
 
-def full_hybrid_logic(ssm_fast_stack, ssm_slow_stack):
+def doc2_hybrid_logic(ssm_fast_stack, ssm_slow_stack):
     """
-    Full baseline: always use slow cache (which contains doc1 + doc2).
-    Fast cache is ignored.
+    Doc2 baseline: always use fast cache (which contains only doc2).
+    Slow cache is ignored.
     """
-    return ssm_slow_stack
+    return ssm_fast_stack
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Full baseline: doc1 + doc2 + few-shot + question")
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
+    parser = argparse.ArgumentParser(description="Doc2 baseline: doc2 + few-shot + question")
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-130m', help='Model name or path')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
     parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--max_new_tokens', type=int, default=30, help='Max tokens to generate')
-    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre/experiments', help='Output directory')
+    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre_130M/experiments', help='Output directory')
     args = parser.parse_args()
     
     device = args.device
@@ -52,7 +52,7 @@ if __name__ == "__main__":
     print(f"✓ Model loaded successfully\n")
     
     print("=" * 70)
-    print("FULL BASELINE")
+    print("DOC2 BASELINE")
     print("=" * 70)
     print(f"Dataset: {args.data_path}")
     print(f"Samples: {args.num_samples}")
@@ -65,7 +65,7 @@ if __name__ == "__main__":
     
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%d%H%M%S")
-    output_file = os.path.join(args.output_dir, f"baseline_full_{timestamp}.csv")
+    output_file = os.path.join(args.output_dir, f"baseline_doc2_{timestamp}.csv")
     
     fieldnames = ['id', 'decoded', 'answer', 'question', 'doc1_title', 'doc2_title', 'doc1_content', 'doc2_content']
     
@@ -85,7 +85,7 @@ if __name__ == "__main__":
             
             try:
                 def hybrid_logic_func(fast, slow):
-                    return full_hybrid_logic(fast, slow)
+                    return doc2_hybrid_logic(fast, slow)
                 
                 decoded = inference_logic(
                     model=model,

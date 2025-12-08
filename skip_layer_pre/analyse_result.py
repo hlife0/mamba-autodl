@@ -109,10 +109,10 @@ def main():
     experiment_names = args.experiments
     
     # 查找并分析每个实验
-    print("=" * 100)
-    print("Experiment Results Analysis")
-    print("=" * 100)
-    print()
+    # print("=" * 100)
+    # print("Experiment Results Analysis")
+    # print("=" * 100)
+    # print()
     
     results_summary = {}
     
@@ -126,12 +126,12 @@ def main():
         filename = os.path.basename(latest_file)
         results = analyze_csv(latest_file)
         
-        print(f"📊 {exp_name.upper()}")
-        print(f"   File: {filename}")
-        print(f"   Total samples: {results['total']}")
-        print(f"   Exact Match: {results['exact_correct']}/{results['total']} = {results['exact_accuracy']:.2f}%")
-        print(f"   Contain Match: {results['contain_correct']}/{results['total']} = {results['contain_accuracy']:.2f}%")
-        print()
+        # print(f"📊 {exp_name.upper()}")
+        # print(f"   File: {filename}")
+        # print(f"   Total samples: {results['total']}")
+        # print(f"   Exact Match: {results['exact_correct']}/{results['total']} = {results['exact_accuracy']:.2f}%")
+        # print(f"   Contain Match: {results['contain_correct']}/{results['total']} = {results['contain_accuracy']:.2f}%")
+        # print()
         
         results_summary[exp_name] = {
             'file': filename,
