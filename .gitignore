@@ -4,6 +4,8 @@
 
 .vscode/
 .cursor/
+.helpers/
+
 
 *experiments*
 *.pt
