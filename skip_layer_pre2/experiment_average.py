@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.utils.generation import InferenceParams
 from dataset.hotpot import HotpotQAIterator
-from skip_layer_pre.utils import prefill_from_scratch, prefill_with_cache, decode_with_cache
+from skip_layer_pre2.utils import prefill_from_scratch, prefill_with_cache, decode_with_cache
 from tqdm import tqdm
 
 
@@ -32,7 +32,7 @@ def inference_average(model, tokenizer, question, doc1, doc2, max_new_tokens=30,
         "A: purple\n\n"
     )
     
-    question_prompt = f"Q: {question}\nA:"
+    question_prompt = f"Q: {question}\n\nA:"
     
     # ========== Path 1: Only doc1 ==========
     tokens_doc1 = tokenizer(doc1_prompt, return_tensors="pt")
@@ -97,13 +97,13 @@ def inference_average(model, tokenizer, question, doc1, doc2, max_new_tokens=30,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Average cache experiment: average doc1 and doc2 caches separately")
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba2-2.7b', help='Model name or path')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
     parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--max_new_tokens', type=int, default=30, help='Max tokens to generate')
-    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre/experiments', help='Output directory')
+    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre2/experiments', help='Output directory')
     args = parser.parse_args()
     
     device = args.device

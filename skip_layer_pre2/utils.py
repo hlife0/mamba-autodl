@@ -160,7 +160,7 @@ def inference_logic(
     )
     
     # Part D: Question
-    question_prompt = f"Q: {question}\nA:"
+    question_prompt = f"Q: {question}\n\nA:"
     
     # ========== Path 1: Fast but poor (only doc2) ==========
     prompt_fast = doc2_prompt
@@ -183,21 +183,23 @@ def inference_logic(
     cache_hybrid.seqlen_offset = cache_slow.seqlen_offset
     
     # ========== Vectorized cache and apply hybrid logic ==========
+    # For Mamba2, SSM states have shape [batch, nheads, headdim, d_state]
     # Stack all SSM states into tensors for batch processing
-    # Shape: [num_layers, batch, d_inner, d_state]
-    ssm_fast_stack = torch.stack([cache_fast.key_value_memory_dict[i][1] for i in range(num_layers)])
-    ssm_slow_stack = torch.stack([cache_slow.key_value_memory_dict[i][1] for i in range(num_layers)])
+    # Shape: [num_layers, batch, nheads, headdim, d_state]
+    ssm_fast_stack = torch.stack([cache_fast.key_value_memory_dict[i][1] for i in range(num_layers)]).to(device)
+    ssm_slow_stack = torch.stack([cache_slow.key_value_memory_dict[i][1] for i in range(num_layers)]).to(device)
     
     # Apply masks: use slow cache for bottom-k dimensions (lowest similarity), fast cache for others
-    ssm_hybrid_stack = hybrid_logic(ssm_fast_stack, ssm_slow_stack)
+    # hybrid_logic should handle both Mamba1 (3D) and Mamba2 (4D) tensors
+    ssm_hybrid_stack = hybrid_logic(ssm_fast_stack, ssm_slow_stack).to(device)
     
     # Store hybrid SSM states
     for layer_idx in range(num_layers):
         # For convolution cache: use fast cache (100%)
-        conv_fast = cache_fast.key_value_memory_dict[layer_idx][0]
+        conv_fast = cache_fast.key_value_memory_dict[layer_idx][0].to(device)
         
         # For SSM state: use hybrid (mixed)
-        ssm_hybrid = ssm_hybrid_stack[layer_idx]
+        ssm_hybrid = ssm_hybrid_stack[layer_idx].to(device)
         
         cache_hybrid.key_value_memory_dict[layer_idx] = (conv_fast, ssm_hybrid)
     

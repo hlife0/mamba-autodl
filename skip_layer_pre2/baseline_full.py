@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Empty baseline: Only few-shot examples + question, no documents.
+Full baseline: Doc1 + Doc2 + Few-shot + Question.
 """
 
 import sys
@@ -14,58 +14,27 @@ import torch
 from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from dataset.hotpot import HotpotQAIterator
-from skip_layer_pre.utils import prefill_from_scratch, decode_with_cache
+from skip_layer_pre2.utils import inference_logic
 from tqdm import tqdm
 
 
-def inference_empty(model, tokenizer, question, max_new_tokens=30, device="cuda"):
+def full_hybrid_logic(ssm_fast_stack, ssm_slow_stack):
     """
-    Empty baseline: only few-shot + question.
+    Full baseline: always use slow cache (which contains doc1 + doc2).
+    Fast cache is ignored.
     """
-    few_shot_prompt = (
-        "Q: Who is older, Alice or Bob?\n"
-        "A: Alice\n\n"
-        "Q: Are cats and dogs both mammals?\n"
-        "A: yes\n\n"
-        "Q: What color do red and blue make?\n"
-        "A: purple\n\n"
-    )
-    
-    question_prompt = f"Q: {question}\nA:"
-    full_prompt = few_shot_prompt + question_prompt
-    
-    tokens = tokenizer(full_prompt, return_tensors="pt")
-    input_ids = tokens.input_ids.to(device)
-    cache, first_token = prefill_from_scratch(model, input_ids, device)
-    
-    generated_tokens = [first_token.item()]
-    current_token = first_token
-    stop_strings = ["\nQ:", "\n\n"]
-    
-    for _ in range(max_new_tokens - 1):
-        cache, next_token = decode_with_cache(model, current_token, cache, device)
-        current_token = next_token
-        generated_tokens.append(next_token.item())
-        
-        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        if any(stop_str in generated_text for stop_str in stop_strings):
-            for stop_str in stop_strings:
-                if stop_str in generated_text:
-                    generated_text = generated_text.split(stop_str)[0]
-            break
-    
-    return generated_text.strip()
+    return ssm_slow_stack
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Empty baseline: few-shot + question only")
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba-2.8b', help='Model name or path')
+    parser = argparse.ArgumentParser(description="Full baseline: doc1 + doc2 + few-shot + question")
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba2-2.7b', help='Model name or path')
     parser.add_argument('--data_path', type=str, default='./dataset/HotpotQA/hotpot_train_v1.1.json', help='Path to HotpotQA dataset')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
     parser.add_argument('--num_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--max_new_tokens', type=int, default=30, help='Max tokens to generate')
-    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre/experiments', help='Output directory')
+    parser.add_argument('--output_dir', type=str, default='./skip_layer_pre2/experiments', help='Output directory')
     args = parser.parse_args()
     
     device = args.device
@@ -83,7 +52,7 @@ if __name__ == "__main__":
     print(f"✓ Model loaded successfully\n")
     
     print("=" * 70)
-    print("EMPTY BASELINE")
+    print("FULL BASELINE")
     print("=" * 70)
     print(f"Dataset: {args.data_path}")
     print(f"Samples: {args.num_samples}")
@@ -96,9 +65,9 @@ if __name__ == "__main__":
     
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%d%H%M%S")
-    output_file = os.path.join(args.output_dir, f"baseline_empty_{timestamp}.csv")
+    output_file = os.path.join(args.output_dir, f"baseline_full_{timestamp}.csv")
     
-    fieldnames = ['id', 'decoded', 'answer', 'question']
+    fieldnames = ['id', 'decoded', 'answer', 'question', 'doc1_title', 'doc2_title', 'doc1_content', 'doc2_content']
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -107,11 +76,24 @@ if __name__ == "__main__":
         
         count = 0
         for item in tqdm(sample_dataset, desc="Processing"):
+            docs = item.get_useful()
+            if len(docs) < 2:
+                continue
+            
+            doc1_with_title = docs[0]['title'] + ": " + docs[0]['content']
+            doc2_with_title = docs[1]['title'] + ": " + docs[1]['content']
+            
             try:
-                decoded = inference_empty(
+                def hybrid_logic_func(fast, slow):
+                    return full_hybrid_logic(fast, slow)
+                
+                decoded = inference_logic(
                     model=model,
                     tokenizer=tokenizer,
+                    hybrid_logic=hybrid_logic_func,
                     question=item.question,
+                    doc1=doc1_with_title,
+                    doc2=doc2_with_title,
                     max_new_tokens=args.max_new_tokens,
                     device=device
                 )
@@ -123,7 +105,11 @@ if __name__ == "__main__":
                 'id': item.id,
                 'decoded': decoded,
                 'answer': item.answer,
-                'question': item.question
+                'question': item.question,
+                'doc1_title': docs[0]['title'],
+                'doc2_title': docs[1]['title'],
+                'doc1_content': docs[0]['content'],
+                'doc2_content': docs[1]['content']
             })
             f.flush()
             count += 1
