@@ -1,11 +1,14 @@
 .conda/
+.claude/
 .venv/
 *__pycache__/
 
 .vscode/
 .cursor/
 .helpers/
-
+.local/
+.tmp/
+.tmpdir/
 
 *experiments*
 *.pt

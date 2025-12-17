@@ -1,6 +1,6 @@
 import torch
-from mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba.mamba_ssm.utils.generation import InferenceParams
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.utils.generation import InferenceParams
 from dataset.hotpot import HotpotQAIterator
 
 
@@ -66,18 +66,9 @@ def prefill_with_cache(model, input_ids, previous_cache, device):
     for i in range(additional_len):
         current_token = input_ids[:, i:i+1]
         
-        # Create position_ids for current position
-        position_ids = torch.full(
-            (batch_size, 1),
-            previous_cache.seqlen_offset,
-            dtype=torch.long,
-            device=device
-        )
-        
         with torch.no_grad():
             logits = model(
                 current_token,
-                position_ids=position_ids,
                 inference_params=previous_cache,
                 num_last_tokens=1
             ).logits
@@ -107,19 +98,10 @@ def decode_with_cache(model, token_id, cache, device):
     """
     batch_size = token_id.shape[0]
     
-    # Create position_ids for current position
-    position_ids = torch.full(
-        (batch_size, 1),
-        cache.seqlen_offset,
-        dtype=torch.long,
-        device=device
-    )
-    
     # Forward pass with single token
     with torch.no_grad():
         logits = model(
             token_id,
-            position_ids=position_ids,
             inference_params=cache,
             num_last_tokens=1
         ).logits
