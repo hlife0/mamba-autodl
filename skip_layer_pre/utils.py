@@ -1,6 +1,6 @@
 import torch
-from mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba.mamba_ssm.utils.generation import InferenceParams
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.utils.generation import InferenceParams
 from dataset.hotpot import HotpotQAIterator
 
 

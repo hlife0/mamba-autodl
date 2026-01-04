@@ -71,12 +71,17 @@ def extract_abc_mamba2(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
         A = -torch.exp(module.A_log.float())  # [nheads]
         
         # Compute discrete A and B
-        # For Mamba2, we need to expand A for each head and position
-        # discrete_A[b, l, h, p, n] = exp(A[h] * dt[b, l, h])
-        dt_expanded = dt.unsqueeze(-1).unsqueeze(-1)  # [batch, seqlen, nheads, 1, 1]
-        A_expanded = A.view(1, 1, -1, 1, 1).expand(1, 1, module.nheads, module.headdim, module.d_state)
+        # For Mamba2: discrete_A[b, l, h, p, n] = exp(A[h] * dt[b, l, h])
+        # A[h] applies to all (p, n), dt[b,l,h] varies per position and head
+        dt_expanded = dt.unsqueeze(-1)  # [batch, seqlen, nheads, 1]
+        A_expanded = A.view(1, 1, -1, 1)  # [1, 1, nheads, 1]
         
-        discrete_A = torch.exp(A_expanded * dt_expanded)  # [batch, seqlen, nheads, headdim, d_state]
+        # discrete_A should be [batch, seqlen, nheads, 1, 1] after exp
+        # then broadcast to [batch, seqlen, nheads, headdim, d_state]
+        discrete_A_scalar = torch.exp(A_expanded * dt_expanded)  # [batch, seqlen, nheads, 1]
+        discrete_A = discrete_A_scalar.unsqueeze(-1).expand(
+            batch, seqlen, module.nheads, module.headdim, module.d_state
+        )  # [batch, seqlen, nheads, headdim, d_state]
         
         # discrete_B[b, l, h, p, g, n] = dt[b, l, h] * B[b, l, g, n]
         # We'll keep it per-group for now
@@ -93,9 +98,15 @@ def extract_abc_mamba2(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
         extracted['headdim'] = module.headdim
         extracted['ngroups'] = module.ngroups
         extracted['d_state'] = module.d_state
+        extracted['D'] = module.D  # Skip connection parameter [nheads]
+        
+        # Capture additional info for verification
+        extracted['z'] = z
+        extracted['out_proj'] = module.out_proj
+        extracted['layer_output'] = output
         
         # Clean up
-        del zxbcdt, z0, x0, z, xBC, dt_expanded, A_expanded, dt_for_B, B_expanded
+        del zxbcdt, z0, x0, xBC, dt_expanded, A_expanded, dt_for_B, B_expanded
     
     target_layer = model.backbone.layers[layer_idx].mixer
     hook_handle = target_layer.register_forward_hook(extract_hook)
@@ -310,9 +321,11 @@ def calculate_alpha_mamba2_simple(discrete_A, discrete_B, C):
     
     # Mask future tokens (j > i should be 0)
     mask = torch.triu(torch.ones(seqlen, seqlen, device=A.device, dtype=torch.bool), diagonal=1)
-    A_cumprod[mask, :, :, :] = 0
+    # Expand mask to match A_cumprod dimensions for masked_fill
+    mask_expanded = mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # [seqlen, seqlen, 1, 1, 1]
+    A_cumprod = A_cumprod.masked_fill(mask_expanded, 0.0)
     
-    del log_A, log_A_cumsum, log_A_cumsum_i, log_A_cumsum_j, log_A_cumprod, mask
+    del log_A, log_A_cumsum, log_A_cumsum_i, log_A_cumsum_j, log_A_cumprod, mask, mask_expanded
     
     # Compute effective B: B_eff[i, j, h, p, n] = A_cumprod[i, j, h, p, n] * B[j, h, n]
     # Need to broadcast properly
@@ -323,14 +336,11 @@ def calculate_alpha_mamba2_simple(discrete_A, discrete_B, C):
     alpha = torch.einsum('in,ijhpn->ijhp', C_mat, B_eff)  # [seqlen, seqlen, nheads, headdim]
     del B_eff
     
-    # Handle diagonal: α[i, i, h, p] = Σ_n C[i, n] * B[i, h, n] (no A_cumprod)
-    # Note: for p dimension, we need to consider all headdim
+    # Diagonal should be 0 because x[i] doesn't affect y[i] in the SSM recursion
+    # y[i] = C[i] @ state[i], then state[i+1] = A[i] * state[i] + B[i] * x[i]
+    # So x[i] only affects future outputs, not y[i] itself
     for i in range(seqlen):
-        # diagonal_alpha[h, p] = Σ_n C[i, n] * B[i, h, n]
-        # But B is [seqlen, nheads, d_state], not per-headdim
-        # Actually for diagonal, all headdim should be the same
-        diagonal_alpha = torch.einsum('n,hn->h', C_mat[i], B[i])  # [nheads]
-        alpha[i, i, :, :] = diagonal_alpha[:, None].expand(-1, headdim)
+        alpha[i, i, :, :] = 0.0
     
     del A, B, C_mat
     
@@ -424,7 +434,10 @@ if __name__ == "__main__":
         # Check some properties
         print(f"\n  Sanity checks:")
         print(f"    - Alpha is causal (upper triangle should be 0):")
-        upper_tri_sum = alpha.triu(diagonal=1).abs().sum().item()
+        # alpha is [seqlen, seqlen, nheads, headdim]
+        # triu works on last 2 dims, so we need to permute seqlen to the end
+        alpha_permuted = alpha.permute(2, 3, 0, 1) # [nheads, headdim, seqlen, seqlen]
+        upper_tri_sum = alpha_permuted.triu(diagonal=1).abs().sum().item()
         print(f"      Upper triangle sum: {upper_tri_sum:.2e} (should be ~0)")
         
         print(f"    - Diagonal values (self-attention):")
