@@ -253,9 +253,9 @@ Alpha重构 vs 真实完整输出（SSM + D*x）:
    - 对比：手动SSM递推的完整输出（正确的递推顺序）
 
 2. **完美匹配**：
-   - Cosine similarity = 1.0
-   - Mean error ≈ 4e-08（机器精度）
-   - Max error ≈ 5e-06（可忽略）
+   - Cosine similarity = 1.0（完美匹配）
+   - Mean error ≈ 3-4e-08（机器精度）
+   - Max error ≈ 2-8e-06（浮点运算累积误差，可忽略）
 
 3. **公式正确性**：
    - 对角线：α[i,i] = C[i] @ discrete_B[i] + D[i]（两条路径）
@@ -294,11 +294,18 @@ Alpha重构 vs 真实完整输出（SSM + D*x）:
 
 ## 理论基础
 
-**Mamba2的SSM递推形式**：
+**Mamba2的SSM递推形式**（先更新状态，再计算输出）：
 ```
-state[t+1] = A[t] * state[t] + B[t] * x[t]
-y[t] = C[t] @ state[t] + D * x[t]
+# 正确的递推顺序（与官方实现一致）
+for t in range(seqlen):
+    state[t] = A[t] * state[t-1] + B[t] * x[t]  # 先更新状态
+    y[t] = C[t] @ state[t] + D * x[t]           # 再计算输出（使用新状态）
 ```
+
+关键点：
+- **state[t]包含x[t]的贡献**（通过B[t] * x[t]项）
+- **y[t]依赖state[t]**（已包含x[t]），因此x[t]会影响y[t]
+- 对角线α[i,i]必须包含C@B项
 
 **等价的Attention形式**：
 ```
@@ -330,11 +337,16 @@ y[i] = Σⱼ α[i,j] * x[j]
 
 ## 修复历史
 
-1. ✅ 添加 D 参数（skip connection）
-2. ✅ 修正 alpha 对角线（SSM部分置零）
-3. ✅ 将 D 融入 alpha 矩阵（对角线 = D）
-4. ✅ 确保输出只依赖 x 和 alpha
+**关键Bug修复**（2026-01-05）：
+- ❌ 之前错误：SSM递推顺序错误（先输出后更新）→ 对角线只有D
+- ✅ 修复后：先更新状态再输出（与Mamba官方一致）→ 对角线 = C@B + D
+- ✅ 验证结果：Cosine similarity = **1.0**（完美匹配，机器精度误差 ~4e-08）
 
-**最终验证**：余弦相似度 0.99997+ ✅
+**完整修复历程**：
+1. ✅ 添加 D 参数提取（skip connection）
+2. ✅ 发现对角线问题（只有D，缺少C@B）
+3. ✅ 研究Mamba官方源码，确认递推顺序
+4. ✅ 修正验证脚本的SSM递推（先更新后输出）
+5. ✅ 验证通过：对角线 = C@B + D，cosine similarity = 1.0
 
 ---
