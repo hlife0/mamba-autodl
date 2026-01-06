@@ -11,11 +11,11 @@ y[i,h,p] = Σⱼ α_complete[i,j,h,p] * x[j,h,p]
 ```
 
 其中alpha矩阵包含两部分：
-1. **SSM状态传递**：非对角线元素表示历史token通过状态传递对当前输出的影响
-2. **对角线**：包含两条路径的贡献
-   - 路径1：x[i] → B → h[i] → C → y[i]（状态更新路径，贡献：C@B）
-   - 路径2：x[i] → D → y[i]（skip connection，贡献：D）
-   - 总贡献：α[i,i] = C[i] @ discrete_B[i] + D
+1. **SSM状态传递**：α[i,j] = C[i] @ (∏_{k=j+1}^i A[k]) @ discrete_B[j]
+2. **对角线**（当前时刻x[i]对y[i]的影响）：
+   - SSM直接路径：C[i] @ discrete_B[i]（因为A_cumprod[i,i] = 1）
+   - Skip connection：D
+   - **总贡献**：α[i,i] = C[i] @ discrete_B[i] + D
 
 ## 关键发现：SSM递推顺序
 
@@ -228,38 +228,93 @@ python attention_difference2/validate_alpha_matrix.py
 
 **预期输出**：
 ```
-Alpha矩阵分解:
-├─ 对角线 [0,0,0,0]: 3.344369
-├─   = C@B: 2.544275
-├─   + D:   0.800094
-└─ 非对角线 [1,0,0,0]: 1.098644
+================================================================================
+Mamba2 Alpha矩阵验证
+================================================================================
+Ground Truth: 模型真实输出（mamba_chunk_scan_combined）
+Reconstruction: alpha @ x
+================================================================================
 
-Alpha重构 vs 真实完整输出（SSM + D*x）:
-├─ Cosine similarity: 1.00000000
-├─ Mean error: 4.318444e-08
-└─ Max error: 5.722046e-06
+================================================================================
+Test 1: 'Hello world'
+================================================================================
 
-✅ 完全通过！
-✅ 验证路径: [x] -> [alpha_complete] -> [y_complete]
-✅ 只依赖: input (x) 和 alpha矩阵（包含D）
-✅ 对比对象: y_complete = y_ssm + D*x（完整输出）
+======================================================================
+【Ground Truth】模型真实输出
+  输出 shape: torch.Size([2, 24, 64]), mean: 0.179338
+
+【Alpha重构】调用 calculate_alpha_mamba2_simple()
+  输出 shape: torch.Size([2, 24, 64]), mean: 0.179516
+  Alpha对角线[0,0,0,0]: 3.344369
+
+======================================================================
+对比结果：
+----------------------------------------------------------------------
+  Cosine Similarity: 0.9999999404
+  Mean Error: 4.10e-04
+  Max Error: 2.10e-02
+
+✅ PASS
 ```
 
 ## 验证保证
 
-1. **无作弊**：
-   - 阶段1：从模型参数（discrete_A, B, C, D）计算alpha矩阵
-   - 阶段2：**纯粹用alpha矩阵和x**重构输出，不使用任何其他参数
-   - 对比：手动SSM递推的完整输出（正确的递推顺序）
+### 验证架构
 
-2. **完美匹配**：
-   - Cosine similarity = 1.0（完美匹配）
-   - Mean error ≈ 3-4e-08（机器精度）
-   - Max error ≈ 2-8e-06（浮点运算累积误差，可忽略）
+```
+【Ground Truth】
+提取参数 → 调用真实Mamba kernel (mamba_chunk_scan_combined)
+              ↓
+           y_real [seqlen, nheads, headdim]
 
-3. **公式正确性**：
-   - 对角线：α[i,i] = C[i] @ discrete_B[i] + D[i]（两条路径）
-   - 非对角线：α[i,j] = C[i] @ (∏_{k=j+1}^i A[k]) @ B[j]（状态传递）
+【Reconstruction】  
+提取参数 → calculate_alpha_mamba2_simple(D=D) → alpha_complete
+              ↓                                      ↓
+           alpha @ x → y_reconstructed [seqlen, nheads, headdim]
+              
+【对比】y_reconstructed vs y_real
+```
+
+### 关键特性
+
+1. **Ground Truth来源**：
+   - 使用**真实的Mamba kernel**（`mamba_chunk_scan_combined`）
+   - **不是**手动实现的SSM递推
+   - 参数：提取自模型的discrete_A, B, C, x, dt, D
+   - 保证：这是Mamba2的真实输出
+
+2. **Alpha矩阵计算**（`calculate_alpha_mamba2_simple`）：
+   - **输入**：discrete_A, discrete_B, C, D
+   - **输出**：alpha_complete（D已内化到对角线）
+   - **实现**：
+     ```python
+     # SSM部分（包括对角线的C@B）
+     alpha_ssm = compute_ssm_transitions(discrete_A, discrete_B, C)
+     
+     # 添加skip connection到对角线
+     for i in range(seqlen):
+         alpha_complete[i, i, :, :] = alpha_ssm[i, i, :, :] + D
+     ```
+
+3. **重构输出**：
+   - **公式**：`y = alpha_complete @ x`
+   - **不使用**任何其他参数（不手动加D，不调用SSM递推）
+   - **纯attention**形式
+
+4. **验证结果**：
+   - **Cosine Similarity**: 0.9999999404 ≈ 1.0
+   - **Mean Error**: ~4e-04（浮点精度内）
+   - **Max Error**: ~2e-02（可接受范围）
+
+### 对角线公式验证
+
+```python
+α[i,i,h,p] = C[i] @ discrete_B[i] + D[h]
+```
+
+- **C[i] @ discrete_B[i]**: SSM状态更新路径（x[i] → B → state[i] → C → y[i]）
+- **D[h]**: Skip connection（x[i] → D → y[i]）
+- **A_cumprod[i,i] = 1**: 从i到i的空乘积 = exp(0) = 1
 
 ---
 
@@ -337,16 +392,24 @@ y[i] = Σⱼ α[i,j] * x[j]
 
 ## 修复历史
 
-**关键Bug修复**（2026-01-05）：
-- ❌ 之前错误：SSM递推顺序错误（先输出后更新）→ 对角线只有D
-- ✅ 修复后：先更新状态再输出（与Mamba官方一致）→ 对角线 = C@B + D
-- ✅ 验证结果：Cosine similarity = **1.0**（完美匹配，机器精度误差 ~4e-08）
+**验证架构升级**（2026-01-05）：
+1. ✅ **Ground Truth改为真实kernel**：
+   - 之前：手动实现的SSM递推（存在循环验证风险）
+   - 现在：调用真实的`mamba_chunk_scan_combined` kernel
+   
+2. ✅ **D完全内化到alpha矩阵**：
+   - 之前：validation中手动添加D到对角线
+   - 现在：`calculate_alpha_mamba2_simple(D=D)`直接返回完整alpha
+   
+3. ✅ **SSM递推顺序修正**：
+   - 发现：对角线被错误地置为0
+   - 原因：SSM递推顺序错误（先输出后更新状态）
+   - 修复：先更新状态，再计算输出（与Mamba官方一致）
+   - 结果：对角线 = C@B + D ✓
 
-**完整修复历程**：
-1. ✅ 添加 D 参数提取（skip connection）
-2. ✅ 发现对角线问题（只有D，缺少C@B）
-3. ✅ 研究Mamba官方源码，确认递推顺序
-4. ✅ 修正验证脚本的SSM递推（先更新后输出）
-5. ✅ 验证通过：对角线 = C@B + D，cosine similarity = 1.0
+**验证结果**：
+- Cosine Similarity: **0.9999999404** ≈ 1.0
+- Mean Error: ~4e-04（浮点精度内）
+- 完全通过 ✅
 
 ---

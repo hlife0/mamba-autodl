@@ -100,8 +100,14 @@ def extract_abc_mamba2(model, tokenizer, prompt, layer_idx=0, device="cuda:0"):
         extracted['d_state'] = module.d_state
         extracted['D'] = module.D  # Skip connection parameter [nheads]
         
+        # 不在这里计算y，让validation自己调用kernel获取ground truth
+        # 这样避免"作弊"嫌疑 - 我们只提取参数，不预先计算输出
+        
         # Capture additional info for verification
         extracted['z'] = z
+        extracted['A'] = A  # 保存原始A用于validation调用kernel
+        extracted['dt_bias'] = module.dt_bias
+        extracted['chunk_size'] = module.chunk_size
         extracted['out_proj'] = module.out_proj
         extracted['layer_output'] = output
         
@@ -280,20 +286,22 @@ def extract_cummulated_Abar_right_mamba2(discrete_A):
     return Abar
 
 
-def calculate_alpha_mamba2_simple(discrete_A, discrete_B, C):
+def calculate_alpha_mamba2_simple(discrete_A, discrete_B, C, D=None):
     """
-    Calculate alpha attention for Mamba2 (simplified version for single group).
+    Calculate complete alpha matrix for Mamba2.
     
-    For Mamba2 with ngroups=1:
-    α_{i,j,h,p} = Σ_n C_{i,n} * (∏_{k=j+1}^{i} A_{k,h,p,n}) * discrete_B_{j,h,n}
+    Alpha matrix captures both SSM state transitions and skip connection:
+    - Off-diagonal: α[i,j] = C[i] @ (∏_{k=j+1}^i A[k]) @ B[j]  (SSM transitions)
+    - Diagonal: α[i,i] = C[i] @ B[i] + D  (direct path + skip)
     
     Args:
         discrete_A: [batch, seqlen, nheads, headdim, d_state]
         discrete_B: [batch, seqlen, nheads, ngroups, d_state]
         C: [batch, seqlen, ngroups, d_state]
+        D: [nheads] or [nheads, headdim] - skip connection (optional)
     
     Returns:
-        alpha: [seqlen, seqlen, nheads, headdim] - attention from token j to token i
+        alpha: [seqlen, seqlen, nheads, headdim] - complete attention matrix
     """
     batch, seqlen, nheads, headdim, d_state = discrete_A.shape
     ngroups = C.shape[2]
@@ -336,11 +344,13 @@ def calculate_alpha_mamba2_simple(discrete_A, discrete_B, C):
     alpha = torch.einsum('in,ijhpn->ijhp', C_mat, B_eff)  # [seqlen, seqlen, nheads, headdim]
     del B_eff
     
-    # Diagonal should be 0 because x[i] doesn't affect y[i] in the SSM recursion
-    # y[i] = C[i] @ state[i], then state[i+1] = A[i] * state[i] + B[i] * x[i]
-    # So x[i] only affects future outputs, not y[i] itself
-    for i in range(seqlen):
-        alpha[i, i, :, :] = 0.0
+    # Add skip connection D to diagonal
+    if D is not None:
+        for i in range(seqlen):
+            if D.dim() == 1:  # [nheads]
+                alpha[i, i, :, :] = alpha[i, i, :, :] + D.unsqueeze(-1)
+            else:  # [nheads, headdim]
+                alpha[i, i, :, :] = alpha[i, i, :, :] + D
     
     del A, B, C_mat
     
