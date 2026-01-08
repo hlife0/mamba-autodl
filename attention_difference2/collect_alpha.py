@@ -49,7 +49,7 @@ def build_prompt(question, doc1, doc2):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect alpha statistics for Mamba2")
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba2-2.7b', 
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba2-1.3b', 
                         help='Model name or path')
     parser.add_argument('--tokenizer_name', type=str, default='EleutherAI/gpt-neox-20b', 
                         help='Tokenizer name')
