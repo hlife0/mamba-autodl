@@ -1,5 +1,5 @@
 """
-Fast Alpha Matrix Extraction for Mamba2 (Last Token Only)
+Fast Alpha/Beta Matrix Extraction for Mamba2 (Last Token Only)
 
 Memory-efficient version: Only extracts attention from all tokens to the LAST token.
 This reduces memory usage from O(seqlen²) to O(seqlen).
@@ -7,6 +7,9 @@ This reduces memory usage from O(seqlen²) to O(seqlen).
 Main Functions:
 - extract_alpha(model, tokenizer, prompt, device, layer_idx): Extract alpha for last token only
   Returns: [seqlen, nheads, headdim] - attention from all tokens to LAST token
+
+- extract_beta(model, tokenizer, prompt, device, layer_idx): Extract beta for last token only
+  Returns: [seqlen, nheads, headdim, d_state] - state propagation weights to LAST token
 
 - extract_alpha_all(model, tokenizer, prompt, device): Extract alpha for all layers at once
   Returns: [num_layers, seqlen, nheads, headdim]
@@ -148,6 +151,239 @@ def extract_alpha(model, tokenizer, prompt, device="cuda:0", layer_idx=0):
     hook_handle.remove()
     
     return result['alpha']
+
+
+def extract_beta(model, tokenizer, prompt, device="cuda:0", layer_idx=0, token_idx=0):
+    """
+    Extract beta state propagation weight from a single token to the LAST token only.
+    
+    Beta formula: beta[h, p, s] = Abar[token_idx, h, p, s] * C[last, s]
+    where Abar[token_idx] = A[token_idx+1] × A[token_idx+2] × ... × A[last]
+    
+    Args:
+        model: Mamba2 model
+        tokenizer: tokenizer
+        prompt: input text (string)
+        device: device to use
+        layer_idx: layer index to extract from
+        token_idx: int - single token position to extract beta for (e.g., a doc1 token position)
+    
+    Returns:
+        beta_last: [nheads, headdim, d_state] - state propagation weights from token_idx to LAST token
+    """
+    # Tokenize
+    tokens = tokenizer(prompt, return_tensors="pt")
+    input_ids = tokens['input_ids'].to(device)
+    
+    result = {'beta': None}
+    
+    def extract_hook(module, input, output):
+        hidden_states = input[0]
+        batch, seqlen, _ = hidden_states.shape
+        last_idx = seqlen - 1
+        
+        # Project and split
+        zxbcdt = module.in_proj(hidden_states)
+        d_mlp = (zxbcdt.shape[-1] - 2 * module.d_ssm - 2 * module.ngroups * module.d_state - module.nheads) // 2
+        
+        # Extract only what we need: xBC and dt
+        _, _, _, xBC, dt = torch.split(
+            zxbcdt,
+            [d_mlp, d_mlp, module.d_ssm, module.d_ssm + 2 * module.ngroups * module.d_state, module.nheads],
+            dim=-1
+        )
+        
+        # Conv1d
+        if module.activation in ["silu", "swish"]:
+            xBC = module.act(module.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :seqlen])
+        
+        # Split into C
+        _, _, C = torch.split(
+            xBC, 
+            [module.d_ssm, module.ngroups * module.d_state, module.ngroups * module.d_state], 
+            dim=-1
+        )
+        
+        # Reshape C
+        C = rearrange(C, "b l (g n) -> b l g n", g=module.ngroups)
+        
+        # Process dt
+        dt = F.softplus(dt + module.dt_bias.to(dtype=dt.dtype))
+        
+        # Get A
+        A = -torch.exp(module.A_log.float())
+        
+        # Compute discrete_A
+        dt_expanded = dt.unsqueeze(-1)  # [batch, seqlen, nheads, 1]
+        A_expanded = A.view(1, 1, -1, 1)  # [1, 1, nheads, 1]
+        
+        discrete_A_scalar = torch.exp(A_expanded * dt_expanded)  # [batch, seqlen, nheads, 1]
+        discrete_A = discrete_A_scalar.unsqueeze(-1).expand(
+            batch, seqlen, module.nheads, module.headdim, module.d_state
+        )
+        
+        # Calculate beta for LAST token only (assume batch=1, ngroups=1)
+        A_vals = discrete_A[0].float()  # [seqlen, nheads, headdim, d_state]
+        C_last = C[0, last_idx, 0, :].float()  # [d_state] - only last token's C
+        
+        # Compute cumulative products from each token j to last token
+        # Abar[j] = prod(A[k] for k in range(j+1, last+1))
+        log_A = torch.log(A_vals + 1e-10)  # [seqlen, nheads, headdim, d_state]
+        log_A_cumsum = torch.cumsum(log_A, dim=0)  # [seqlen, nheads, headdim, d_state]
+        
+        # Abar[j] = exp(log_A_cumsum[last] - log_A_cumsum[j])
+        log_A_cumsum_last = log_A_cumsum[last_idx]  # [nheads, headdim, d_state]
+        log_A_cumsum_j = log_A_cumsum  # [seqlen, nheads, headdim, d_state]
+        
+        # Abar[j] = A[j+1] × A[j+2] × ... × A[last]
+        Abar = torch.exp(log_A_cumsum_last.unsqueeze(0) - log_A_cumsum_j)  # [seqlen, nheads, headdim, d_state]
+        
+        # Select only the specified token
+        Abar_token = Abar[token_idx]  # [nheads, headdim, d_state]
+        
+        # Compute beta: β[h,p,s] = Abar[token_idx,h,p,s] * C_last[s]
+        beta_last = Abar_token * C_last.unsqueeze(0).unsqueeze(0)  # [nheads, headdim, d_state]
+        
+        # Store result
+        result['beta'] = beta_last
+        
+        # Cleanup
+        del zxbcdt, xBC, C, dt, dt_expanded, A_expanded, discrete_A_scalar, discrete_A
+        del A_vals, C_last, log_A, log_A_cumsum, log_A_cumsum_last, log_A_cumsum_j, Abar
+        torch.cuda.empty_cache()
+    
+    # Register hook
+    target_layer = model.backbone.layers[layer_idx].mixer
+    hook_handle = target_layer.register_forward_hook(extract_hook)
+    
+    # Forward pass
+    with torch.no_grad():
+        _ = model(input_ids)
+    
+    # Cleanup
+    hook_handle.remove()
+    
+    return result['beta']
+
+
+def extract_beta_all(model, tokenizer, prompt, device="cuda:0", token_idx=0):
+    """
+    Extract beta state propagation weights from a single token to the LAST token for ALL layers.
+    
+    Single forward pass extracts beta from all layers simultaneously.
+    
+    Args:
+        model: Mamba2 model
+        tokenizer: tokenizer
+        prompt: input text (string)
+        device: device to use
+        token_idx: int - single token position to extract beta for (e.g., last token of doc1)
+    
+    Returns:
+        beta_all: [num_layers, nheads, headdim, d_state] - beta from token_idx to last token for all layers
+    """
+    # Tokenize
+    tokens = tokenizer(prompt, return_tensors="pt")
+    input_ids = tokens['input_ids'].to(device)
+    
+    num_layers = len(model.backbone.layers)
+    results = [{'beta': None} for _ in range(num_layers)]
+    
+    def make_extract_hook(layer_idx):
+        def extract_hook(module, input, output):
+            hidden_states = input[0]
+            batch, seqlen, _ = hidden_states.shape
+            last_idx = seqlen - 1
+            
+            # Validate token_idx
+            if token_idx < 0 or token_idx >= seqlen:
+                raise ValueError(f"token_idx={token_idx} is out of bounds for sequence length {seqlen}")
+            
+            # Project and split
+            zxbcdt = module.in_proj(hidden_states)
+            d_mlp = (zxbcdt.shape[-1] - 2 * module.d_ssm - 2 * module.ngroups * module.d_state - module.nheads) // 2
+            
+            _, _, _, xBC, dt = torch.split(
+                zxbcdt,
+                [d_mlp, d_mlp, module.d_ssm, module.d_ssm + 2 * module.ngroups * module.d_state, module.nheads],
+                dim=-1
+            )
+            
+            # Conv1d
+            if module.activation in ["silu", "swish"]:
+                xBC = module.act(module.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :seqlen])
+            
+            # Split into C
+            _, _, C = torch.split(
+                xBC, 
+                [module.d_ssm, module.ngroups * module.d_state, module.ngroups * module.d_state], 
+                dim=-1
+            )
+            
+            C = rearrange(C, "b l (g n) -> b l g n", g=module.ngroups)
+            
+            # Process dt
+            dt = F.softplus(dt + module.dt_bias.to(dtype=dt.dtype))
+            
+            # Get A
+            A = -torch.exp(module.A_log.float())
+            
+            # Compute discrete_A
+            dt_expanded = dt.unsqueeze(-1)
+            A_expanded = A.view(1, 1, -1, 1)
+            
+            discrete_A_scalar = torch.exp(A_expanded * dt_expanded)
+            discrete_A = discrete_A_scalar.unsqueeze(-1).expand(
+                batch, seqlen, module.nheads, module.headdim, module.d_state
+            )
+            
+            # Calculate beta
+            A_vals = discrete_A[0].float()
+            C_last = C[0, last_idx, 0, :].float()
+            
+            log_A = torch.log(A_vals + 1e-10)
+            log_A_cumsum = torch.cumsum(log_A, dim=0)
+            
+            log_A_cumsum_last = log_A_cumsum[last_idx]
+            log_A_cumsum_j = log_A_cumsum
+            
+            Abar = torch.exp(log_A_cumsum_last.unsqueeze(0) - log_A_cumsum_j)
+            
+            # Select only the specified token
+            Abar_token = Abar[token_idx]
+            
+            # Compute beta
+            beta_last = Abar_token * C_last.unsqueeze(0).unsqueeze(0)
+            
+            # Store result (move to CPU to save GPU memory)
+            results[layer_idx]['beta'] = beta_last.cpu()
+            
+            # Cleanup
+            del zxbcdt, xBC, C, dt, dt_expanded, A_expanded, discrete_A_scalar, discrete_A
+            del A_vals, C_last, log_A, log_A_cumsum, log_A_cumsum_last, log_A_cumsum_j, Abar
+            torch.cuda.empty_cache()
+        
+        return extract_hook
+    
+    # Register hooks for all layers
+    hooks = []
+    for layer_idx in range(num_layers):
+        target_layer = model.backbone.layers[layer_idx].mixer
+        hook = target_layer.register_forward_hook(make_extract_hook(layer_idx))
+        hooks.append(hook)
+    
+    # Single forward pass
+    with torch.no_grad():
+        _ = model(input_ids)
+    
+    # Remove hooks
+    for hook in hooks:
+        hook.remove()
+    
+    # Stack results
+    beta_all = torch.stack([r['beta'] for r in results], dim=0)  # [num_layers, nheads, headdim, d_state]
+    
+    return beta_all
 
 
 def extract_alpha_all(model, tokenizer, prompt, device="cuda:0"):
