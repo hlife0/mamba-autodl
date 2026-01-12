@@ -49,7 +49,7 @@ def build_prompt(question, doc1, doc2):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect beta statistics for Mamba2")
-    parser.add_argument('--model_path', type=str, default='state-spaces/mamba2-1.3b', 
+    parser.add_argument('--model_path', type=str, default='state-spaces/mamba2-130m', 
                         help='Model name or path')
     parser.add_argument('--tokenizer_name', type=str, default='EleutherAI/gpt-neox-20b', 
                         help='Tokenizer name')
@@ -123,48 +123,62 @@ if __name__ == "__main__":
         if len(docs) < 2:
             continue
         all_doc1_samples.append({
+            'doc_with_title': "[" + docs[0]['title'] + "] " + docs[0]['content'],
+            'doc_id': item.id,
             'question': item.question,
-            'doc_with_title': docs[0],
-            'doc_id': item.id
         })
+        if len(all_doc1_samples) >= args.num_samples:
+            break
     
-    print(f"Collected {len(all_doc1_samples)} doc1 samples")
-    
-    # Select partial doc2 samples
-    partial_dataset = dataset.random_choose(args.num_partial_samples, seed=args.seed + 1)
+    # Collect partial doc2 samples (from SAME sample_dataset as alpha)
+    count_partial = 0
     doc2_samples = []
-    for item in partial_dataset:
+    for item in sample_dataset:
         docs = item.get_useful()
         if len(docs) < 2:
             continue
         doc2_samples.append({
-            'question': item.question,
-            'doc_with_title': docs[1],
-            'doc_id': item.id
+            'doc_with_title': "[" + docs[1]['title'] + "] " + docs[1]['content'],
+            'doc_id': item.id,
+            'question': item.question
         })
-    
-    print(f"Selected {len(doc2_samples)} doc2 samples")
-    print()
+        count_partial += 1
+        if count_partial >= args.num_partial_samples:
+            break
     
     # Create output directory
-    timestamp = datetime.now().strftime("%m%d%H%M")
-    exp_name = f"{args.experiment_name}_{timestamp}"
-    output_path = os.path.join(args.output_dir, exp_name)
-    os.makedirs(output_path, exist_ok=True)
-    print(f"Output directory: {output_path}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%d%H%M%S")
+    output_subdir = os.path.join(args.output_dir, f"{args.experiment_name}_{timestamp}")
+    os.makedirs(output_subdir, exist_ok=True)
+    
+    print(f"Output directory: {output_subdir}\n")
+    print(f"Total doc1 (all): {len(all_doc1_samples)}")
+    print(f"Total doc2 (partial): {len(doc2_samples)}")
+    print(f"Total pairs: {len(all_doc1_samples) * len(doc2_samples)}\n")
+    print("Starting collection...")
     print()
     
-    # Process each doc2
-    for doc2_idx, doc2_sample in enumerate(tqdm(doc2_samples, desc="Processing doc2 samples")):
+    # OUTER LOOP: iterate over doc2 (partial)
+    pbar_doc2 = tqdm(total=len(doc2_samples), desc="Processing doc2 (partial)")
+    
+    for doc2_sample in doc2_samples:
         doc2_id = doc2_sample['doc_id']
         
-        # Initialize statistics
+        # Clear GPU cache before processing new doc2
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # Online computation of mean and variance (Welford's algorithm)
         count = 0
         beta_mean = None
         beta_M2 = None  # For variance computation
         
-        # Process all doc1 samples for this doc2
-        for doc1_sample in tqdm(all_doc1_samples, desc=f"  doc2={doc2_id[:8]}", leave=False):
+        # INNER LOOP: process all doc1
+        total_doc1 = len(all_doc1_samples)
+        pbar_doc1 = tqdm(total=total_doc1, desc=f"  doc2={doc2_id[:8]}", leave=False)
+        
+        for doc1_sample in all_doc1_samples:
             try:
                 # Build prompt
                 first_half, second_half = build_prompt(
@@ -189,62 +203,80 @@ if __name__ == "__main__":
                 
                 beta = beta.float()
                 
-                # Welford's online algorithm
+                # Welford's online algorithm for mean and variance
                 count += 1
                 
                 if beta_mean is None:
                     # First sample
                     beta_mean = beta.clone()
                     beta_M2 = torch.zeros_like(beta)
+                    del beta
                 else:
-                    # Update
+                    # Update statistics
                     delta = beta - beta_mean
                     beta_mean += delta / count
                     delta2 = beta - beta_mean
                     beta_M2 += delta * delta2
+                    del beta, delta, delta2
                 
                 # Cleanup
-                del beta
                 torch.cuda.empty_cache()
                 
             except Exception as e:
-                print(f"\n  Error processing doc1={doc1_sample['doc_id'][:8]}: {e}")
+                print(f"\nError processing doc1={doc1_sample['doc_id'][:8]}: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            pbar_doc1.update(1)
+        
+        pbar_doc1.close()
+        
+        # Finalize statistics computation
+        try:
+            print(f"\n  Finalizing statistics for doc2={doc2_id[:8]}...")
+            
+            if count == 0:
+                print(f"  ✗ No data collected for doc2={doc2_id}, skipping...")
+                pbar_doc2.update(1)
                 continue
+            
+            # Compute variance from M2 (Welford's algorithm)
+            if count > 1:
+                beta_var = beta_M2 / (count - 1)  # Sample variance
+            else:
+                beta_var = torch.zeros_like(beta_mean)
+            
+            # Save statistics
+            output_file = os.path.join(output_subdir, f"{doc2_id}.pt")
+            torch.save({
+                'beta_mean': beta_mean,
+                'beta_var': beta_var,
+                'doc2_id': doc2_id,
+                'num_doc1_samples': count,
+                'n_layer': n_layer,
+                'nheads': nheads,
+                'headdim': headdim,
+                'd_state': d_state,
+                'note': 'beta_mean shape: [n_layer, nheads, headdim, d_state]. Beta measures doc1_last_token → sequence_last_token state propagation.',
+            }, output_file)
+            
+            print(f"  ✓ Saved statistics to {doc2_id}.pt (n={count})")
+            
+            # Clear memory
+            del beta_mean, beta_M2, beta_var
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"\nError finalizing statistics for doc2={doc2_id}: {e}")
+            import traceback
+            traceback.print_exc()
         
-        # Calculate variance
-        if count > 1:
-            beta_var = beta_M2 / count
-        else:
-            beta_var = torch.zeros_like(beta_mean)
-        
-        # Save results for this doc2
-        result = {
-            'doc2_id': doc2_id,
-            'doc2_text': doc2_sample['doc_with_title'],
-            'question': doc2_sample['question'],
-            'num_doc1_samples': count,
-            'beta_mean': beta_mean,
-            'beta_var': beta_var
-        }
-        
-        # Save to file
-        output_file = os.path.join(output_path, f'{doc2_id}.pt')
-        torch.save(result, output_file)
-        
-        # Cleanup
-        del beta_mean, beta_M2, beta_var, result
-        torch.cuda.empty_cache()
+        pbar_doc2.update(1)
     
-    print()
+    pbar_doc2.close()
+    
+    print("\n" + "=" * 70)
+    print("Collection complete!")
+    print(f"Total doc2 processed: {len(doc2_samples)}")
+    print(f"Output directory: {output_subdir}")
     print("=" * 70)
-    print("COLLECTION COMPLETE")
-    print("=" * 70)
-    print(f"Saved {len(doc2_samples)} files to: {output_path}")
-    print()
-    print("Each file contains:")
-    print("  - beta_mean: [n_layer, nheads, headdim, d_state]")
-    print("  - beta_var:  [n_layer, nheads, headdim, d_state]")
-    print()
-    print(f"Total doc2 samples: {len(doc2_samples)}")
-    print(f"Doc1 samples per doc2: {len(all_doc1_samples)}")
-    print(f"Total computations: {len(doc2_samples) * len(all_doc1_samples)}")

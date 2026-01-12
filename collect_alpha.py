@@ -310,3 +310,8 @@ if __name__ == "__main__":
     print(f"Total doc2 processed: {len(partial_doc2_samples)}")
     print(f"Output directory: {output_subdir}")
     print("=" * 70)
+
+
+python attention_difference2/collect_beta.py --device cuda:0 --model_path state-spaces/mamba2-130m --experiment_name beta_stats_130m
+python attention_difference2/collect_beta.py --device cuda:0 --model_path state-spaces/mamba2-1.3b --experiment_name beta_stats_1.3b
+python attention_difference2/collect_beta.py --device cuda:0 --model_path state-spaces/mamba2-1.3b --experiment_name beta_stats_1.3b
